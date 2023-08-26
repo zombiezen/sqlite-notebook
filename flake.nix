@@ -9,7 +9,10 @@
   outputs = { self, nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ self.overlays.bear ];
+        };
       in
       {
         packages.default = pkgs.callPackage ./package.nix {};
@@ -21,7 +24,15 @@
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [self.packages.${system}.default];
+
+          packages = [
+            pkgs.bear
+          ];
         };
       }
-    );
+    ) // {
+      overlays.bear = final: prev: {
+        bear = prev.callPackage ./bear {};
+      };
+    };
 }
