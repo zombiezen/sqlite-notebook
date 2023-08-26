@@ -1,2 +1,12 @@
 # shellcheck shell=sh
-rc_include 
+rc_include rc/CC.rc rc/pkg-config.rc
+
+prog="
+#include <sqlite3.h>
+
+void f() { sqlite3_libversion(); }
+"
+
+rc_pkg_detect SQLITE "sqlite3" \
+  rc_compile cc link "$prog"
+rc_save

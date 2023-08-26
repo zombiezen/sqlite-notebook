@@ -3,6 +3,7 @@
 , redo-apenwarr
 , sqlite
 , zeromq
+, pkg-config
 }:
 
 let pname = "sqlite-notebook"; in stdenv.mkDerivation {
@@ -19,11 +20,27 @@ let pname = "sqlite-notebook"; in stdenv.mkDerivation {
   };
 
   buildInputs = [
-    sqlite
+    sqlite.dev
     zeromq
   ];
 
   nativeBuildInputs = [
+    pkg-config
     redo-apenwarr
   ];
+
+  configureScript = "../configure";
+
+  configurePlatforms = [ "host" ];
+
+  preConfigure = ''
+    mkdir -p out
+    cd out
+    configureFlagsArray+=( CC="$CC" CXX="$CXX" )
+    unset CC CXX
+  '';
+
+  passthru = {
+    inherit sqlite zeromq;
+  };
 }

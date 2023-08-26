@@ -1,0 +1,11 @@
+# shellcheck shell=sh
+
+rc_include \
+  rc/CC.required.rc \
+  rc/libzmq.required.rc \
+  rc/sqlite.required.rc
+
+rc_appendln LIBS "$LIBZMQ"
+rc_appendln LIBS "$SQLITE"
+
+rc_save

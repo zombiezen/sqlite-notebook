@@ -1,0 +1,6 @@
+# shellcheck shell=sh
+rc_include all.rc
+
+cat <<-EOF
+  main.c
+EOF
