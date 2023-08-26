@@ -20,15 +20,8 @@
         };
 
         devShells.default = pkgs.mkShell {
-          packages = [];
-
           inputsFrom = [self.packages.${system}.default];
         };
       }
-    ) // {
-      lib = {};
-      overlays = {};
-      nixosModules = {};
-      nixosConfigurations = {};
-    };
+    );
 }
