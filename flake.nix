@@ -27,6 +27,8 @@
 
           packages = [
             pkgs.bear
+            pkgs.sqlite-interactive
+            pkgs.valgrind
           ];
         };
       }
