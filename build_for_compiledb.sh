@@ -18,6 +18,5 @@ configureWithFlags() {
   "$myconfigure" "$@"
 }
 configureWithFlags
-# shellcheck disable=SC2046
-unset $(env | sed -e 's/=.*$//' | grep '^REDO_\|^REDO$\|^MAKEFLAGS$\|^DO_BUILT$')
-redo
+
+redo -k sqlite-notebook || true

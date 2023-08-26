@@ -1,6 +1,8 @@
 # shellcheck shell=sh
 exec >&2
-myoutdir="$(mktemp -d)"
+myoutdir=_compiledb_out
+rm -rf "$myoutdir"
+mkdir -p "$myoutdir"
 trap 'rm -rf "$myoutdir"' EXIT
 
 redo-ifchange \
