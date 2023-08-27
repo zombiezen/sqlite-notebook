@@ -28,6 +28,11 @@
             pkgs.cargo
             pkgs.rust-analyzer
             pkgs.rustfmt
+
+            (pkgs.python3.withPackages (ps: [
+              ps.notebook
+              ps.jupyter_console
+            ]))
           ];
         };
       }

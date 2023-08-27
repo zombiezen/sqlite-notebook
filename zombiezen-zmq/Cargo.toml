@@ -10,3 +10,4 @@ bitflags = "2.4.0"
 errno = "0.3.2"
 libc = "0.2.147"
 libzmq-sys = { path = "../libzmq-sys" }
+tracing = "0.1.37"

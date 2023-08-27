@@ -6,6 +6,7 @@ use std::time::Duration;
 use bitflags::bitflags;
 use errno::{errno, Errno};
 use libzmq_sys::{zmq_poll, zmq_pollitem_t, ZMQ_POLLERR, ZMQ_POLLIN, ZMQ_POLLOUT, ZMQ_POLLPRI};
+use tracing::{field, trace_span};
 
 use super::Socket;
 
@@ -15,15 +16,21 @@ pub fn poll<'a, 'c: 'a>(
     timeout: Option<Duration>,
     items: impl IntoIterator<Item = PollItem<'a, 'c>>,
 ) -> Result<Vec<(usize, Events)>, Errno> {
+    let span = trace_span!("zmq_poll", n = field::Empty, errno = field::Empty);
+    let _enter = span.enter();
+
     let mut items: Vec<zmq_pollitem_t> = items.into_iter().map(|item| item.into_c()).collect();
     let timeout: c_long = match timeout {
         Some(d) => d.as_millis().try_into().map_err(|_| Errno(libc::EINVAL))?,
         None => -1,
     };
-    let rc = unsafe { zmq_poll(items.as_mut_ptr(), items.len() as c_int, timeout) };
-    if rc < 0 {
-        return Err(errno());
+    let n = unsafe { zmq_poll(items.as_mut_ptr(), items.len() as c_int, timeout) };
+    if n < 0 {
+        let e = errno();
+        span.record("errno", e.0);
+        return Err(e);
     }
+    span.record("n", n);
     Ok(items
         .into_iter()
         .enumerate()

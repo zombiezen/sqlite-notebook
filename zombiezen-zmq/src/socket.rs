@@ -11,6 +11,7 @@ use libzmq_sys::{
     zmq_bind, zmq_close, zmq_connect, zmq_getsockopt, zmq_recv, zmq_send, ZMQ_DONTWAIT, ZMQ_PUB,
     ZMQ_RCVMORE, ZMQ_REP, ZMQ_REQ, ZMQ_ROUTER, ZMQ_SNDMORE, ZMQ_SUB,
 };
+use tracing::{field, trace_span};
 
 use super::Context;
 
@@ -65,6 +66,16 @@ impl<'c> Socket<'c> {
 
     /// Receives a message part from the socket and copies it into `buf`.
     pub fn recv(&mut self, buf: &mut [u8], flags: RecvFlags) -> Result<RecvResult, Errno> {
+        let span = trace_span!(
+            "zmq_recv",
+            buf_len = buf.len(),
+            part_len = field::Empty,
+            more = field::Empty,
+            ok = field::Empty,
+            errno = field::Empty,
+        );
+        let _enter = span.enter();
+
         let n = unsafe {
             zmq_recv(
                 self.ptr.as_ptr(),
@@ -74,8 +85,13 @@ impl<'c> Socket<'c> {
             )
         };
         if n < 0 {
-            return Err(errno());
+            span.record("ok", false);
+            let e = errno();
+            span.record("errno", e.0);
+            return Err(e);
         }
+        span.record("ok", true);
+        span.record("part_len", n);
         let more = {
             let mut more = MaybeUninit::<c_int>::uninit();
             let mut option_len = mem::size_of::<c_int>() as size_t;
@@ -89,6 +105,7 @@ impl<'c> Socket<'c> {
                 more.assume_init() != 0
             }
         };
+        span.record("more", more);
         Ok(RecvResult {
             n: n as usize,
             buf_len: buf.len(),
@@ -106,10 +123,14 @@ impl<'c> Socket<'c> {
         mut buf: &'a mut [u8],
         flags: RecvFlags,
     ) -> Result<Vec<&'a [u8]>, Errno> {
+        let span = trace_span!("zmq_recv_message");
+        let _enter = span.enter();
+
         let mut first_error: Option<Errno> = None;
         let mut msg = Vec::new();
         loop {
             match self.recv(buf, flags) {
+                Err(Errno(libc::EINTR)) => { /* Retry */ }
                 Err(err) => {
                     if first_error.is_none() {
                         first_error = Some(err);
@@ -131,6 +152,15 @@ impl<'c> Socket<'c> {
     /// Once `send` returns, the message has not necessarily been transmitted to the endpoint,
     /// but it is present in 0MQ's queue.
     pub fn send(&mut self, buf: &[u8], flags: SendFlags) -> Result<(), Errno> {
+        let span = trace_span!(
+            "zmq_send",
+            len = buf.len(),
+            more = flags.contains(SendFlags::SNDMORE),
+            ok = field::Empty,
+            errno = field::Empty,
+        );
+        let _enter = span.enter();
+
         let rc = unsafe {
             zmq_send(
                 self.ptr.as_ptr(),
@@ -140,9 +170,13 @@ impl<'c> Socket<'c> {
             )
         };
         if rc >= 0 {
+            span.record("ok", true);
             Ok(())
         } else {
-            Err(errno())
+            span.record("ok", false);
+            let e = errno();
+            span.record("errno", e.0);
+            Err(e)
         }
     }
 
@@ -155,6 +189,9 @@ impl<'c> Socket<'c> {
         M: IntoIterator<Item = P>,
         P: AsRef<[u8]>,
     {
+        let span = trace_span!("zmq_send_message");
+        let _enter = span.enter();
+
         let mut iter = msg.into_iter().peekable();
         loop {
             let part = match iter.next() {
@@ -163,7 +200,13 @@ impl<'c> Socket<'c> {
             };
             let mut part_flags = flags;
             part_flags.set(SendFlags::SNDMORE, iter.peek().is_some());
-            self.send(part.as_ref(), part_flags)?;
+            'send: loop {
+                match self.send(part.as_ref(), part_flags) {
+                    Ok(()) => break 'send,
+                    Err(Errno(libc::EINTR)) => { /* Retry */ }
+                    Err(e) => return Err(e),
+                }
+            }
         }
     }
 }

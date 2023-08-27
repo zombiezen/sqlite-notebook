@@ -1,5 +1,6 @@
 { rustPlatform
 , nix-gitignore
+, jq
 , openssl
 , sqlite
 , zeromq
@@ -28,9 +29,15 @@ let pname = "sqlite-notebook"; in rustPlatform.buildRustPackage {
   ];
 
   nativeBuildInputs = [
+    jq
     pkg-config
     rustPlatform.bindgenHook
   ];
+
+  postInstall = ''
+    mkdir -p "$out/share/jupyter/kernels/sqlite-notebook"
+    bash ${./make_kernel_json.sh} "$out/bin/sqlite-notebook" > "$out/share/jupyter/kernels/sqlite-notebook/kernel.json"
+  '';
 
   passthru = {
     inherit openssl sqlite zeromq;
