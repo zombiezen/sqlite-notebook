@@ -14,9 +14,7 @@
         };
       in
       {
-        packages.default = pkgs.callPackage ./package.nix {
-          libclang = pkgs.pkgsBuildHost.rustc.llvmPackages.libclang;
-        };
+        packages.default = pkgs.callPackage ./package.nix {};
 
         apps.default = {
           type = "app";
@@ -25,10 +23,6 @@
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [self.packages.${system}.default];
-
-          shellHook = ''
-            export LIBCLANG_PATH=${self.packages.${system}.default.LIBCLANG_PATH}
-          '';
 
           packages = [
             pkgs.cargo

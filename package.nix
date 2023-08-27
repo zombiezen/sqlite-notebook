@@ -1,17 +1,12 @@
 { rustPlatform
-, stdenv
-, lib
 , nix-gitignore
 , openssl
 , sqlite
 , zeromq
-, libclang # for bindgen
 , pkg-config
 }:
 
-let
-  pname = "sqlite-notebook";
-in rustPlatform.buildRustPackage {
+let pname = "sqlite-notebook"; in rustPlatform.buildRustPackage {
   name = pname;
 
   src = let
@@ -24,7 +19,7 @@ in rustPlatform.buildRustPackage {
     filter = nix-gitignore.gitignoreFilterPure (_: _: true) patterns root;
   };
 
-  LIBCLANG_PATH = "${libclang.lib}/lib/libclang.so";
+  cargoLock.lockFile = ./Cargo.lock;
 
   buildInputs = [
     openssl.dev
@@ -34,19 +29,8 @@ in rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [
     pkg-config
+    rustPlatform.bindgenHook
   ];
-
-  cargoLock.lockFile = ./Cargo.lock;
-
-  preBuild = ''
-    export BINDGEN_EXTRA_CLANG_ARGS="$(< ${stdenv.cc}/nix-support/libc-crt1-cflags)
-      $(< ${stdenv.cc}/nix-support/libc-cflags) \
-      $(< ${stdenv.cc}/nix-support/cc-cflags) \
-      $(< ${stdenv.cc}/nix-support/libcxx-cxxflags) \
-      ${lib.optionalString stdenv.cc.isClang "-idirafter ${stdenv.cc.cc}/lib/clang/${lib.getVersion stdenv.cc.cc}/include"} \
-      ${lib.optionalString stdenv.cc.isGNU "-isystem ${stdenv.cc.cc}/include/c++/${lib.getVersion stdenv.cc.cc} -isystem ${stdenv.cc.cc}/include/c++/${lib.getVersion stdenv.cc.cc}/${stdenv.hostPlatform.config} -idirafter ${stdenv.cc.cc}/lib/gcc/${stdenv.hostPlatform.config}/${lib.getVersion stdenv.cc.cc}/include"}
-    "
-  '';
 
   passthru = {
     inherit openssl sqlite zeromq;
