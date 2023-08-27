@@ -15,8 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::debug;
 use tracing::error;
+use tracing::trace_span;
 use tracing::Level;
 use tracing::{debug_span, field, info};
+use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Builder as UuidBuilder;
 use zombiezen_zmq::{
     Context as ZeroMQContext, Errno, Events, PollItem, RecvFlags, SendFlags, Socket,
@@ -86,7 +88,7 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let mut sink_builder = tracing_subscriber::fmt();
+    let mut sink_builder = tracing_subscriber::fmt().with_span_events(FmtSpan::CLOSE);
     if args.debug {
         sink_builder = sink_builder.with_max_level(Level::DEBUG);
     }
@@ -320,6 +322,14 @@ where
     K: AsRef<[u8]>,
     P: AsRef<[u8]>,
 {
+    let span = debug_span!(
+        "execute",
+        code = field::Empty,
+        execution_count = field::Empty,
+        silent = field::Empty,
+        store_history = field::Empty,
+    );
+
     let req_content: wire::ExecuteRequest =
         message
             .deserialize_content()
@@ -327,6 +337,10 @@ where
                 exception_value: format!("parse request: {}", err).into(),
                 ..wire::ErrorReply::new("ValueError")
             })?;
+    span.record("code", &req_content.code);
+    span.record("silent", req_content.silent);
+    span.record("store_history", req_content.store_history);
+    let _enter = span.enter();
 
     reply(
         session_id,
@@ -345,6 +359,7 @@ where
     })?;
 
     let execution_count = *execution_counter + 1;
+    span.record("execution_count", execution_count);
     if !req_content.silent && req_content.store_history {
         *execution_counter += 1;
     }
@@ -430,6 +445,9 @@ where
 }
 
 fn handle_heartbeat(socket: &mut Socket) -> Result<()> {
+    let span = trace_span!("heartbeat");
+    let _enter = span.enter();
+
     let mut buf = [0u8; 4096];
     let result = socket.recv(&mut buf, RecvFlags::default())?;
     if result.is_truncated() {
@@ -452,6 +470,9 @@ where
     S: AsRef<str>,
     K: AsRef<[u8]>,
 {
+    let span = debug_span!("control", msg_type = field::Empty);
+    let _enter = span.enter();
+
     let mut buf = [0u8; 4096];
     let message = socket.recv_message(&mut buf, RecvFlags::default())?;
     let message = match wire::Message::deserialize(auth, message) {
@@ -459,7 +480,10 @@ where
         Err(_) => return Ok(true),
     };
     match message.parse_header() {
-        Ok(hdr) => Ok(&hdr.r#type != "shutdown_request"),
+        Ok(hdr) => {
+            span.record("msg_type", &hdr.r#type);
+            Ok(&hdr.r#type != "shutdown_request")
+        }
         Err(_) => return Ok(true),
     }
 }

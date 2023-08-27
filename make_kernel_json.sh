@@ -8,7 +8,7 @@ fi
 
 json_path="$(echo -n "$1" | jq --raw-input --slurp .)"
 echo '{'
-echo "  \"argv\": [$json_path, \"--debug\", \"--\", \"{connection_file}\"],"
+echo "  \"argv\": [$json_path, \"--\", \"{connection_file}\"],"
 echo '  "interrupt_mode": "message",'
 echo '  "display_name": "SQLite",'
 echo '  "language": "sql"'
