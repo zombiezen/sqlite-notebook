@@ -11,11 +11,12 @@
       let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ self.overlays.bear ];
         };
       in
       {
-        packages.default = pkgs.callPackage ./package.nix {};
+        packages.default = pkgs.callPackage ./package.nix {
+          libclang = pkgs.pkgsBuildHost.rustc.llvmPackages.libclang;
+        };
 
         apps.default = {
           type = "app";
@@ -25,16 +26,16 @@
         devShells.default = pkgs.mkShell {
           inputsFrom = [self.packages.${system}.default];
 
+          shellHook = ''
+            export LIBCLANG_PATH=${self.packages.${system}.default.LIBCLANG_PATH}
+          '';
+
           packages = [
-            pkgs.bear
-            pkgs.sqlite-interactive
-            pkgs.valgrind
+            pkgs.cargo
+            pkgs.rust-analyzer
+            pkgs.rustfmt
           ];
         };
       }
-    ) // {
-      overlays.bear = final: prev: {
-        bear = prev.callPackage ./bear {};
-      };
-    };
+    );
 }
