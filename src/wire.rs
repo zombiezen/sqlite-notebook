@@ -260,6 +260,46 @@ impl Serialize for ExecuteReply {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct IsCompleteRequest {
+    pub(crate) code: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct IsCompleteReply {
+    pub(crate) status: IsCompleteStatus,
+    pub(crate) indent: Option<String>,
+}
+
+#[repr(i8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum IsCompleteStatus {
+    Complete,
+    Incomplete,
+    Invalid,
+    Unknown,
+}
+
+impl Default for IsCompleteStatus {
+    fn default() -> Self {
+        IsCompleteStatus::Unknown
+    }
+}
+
+impl Serialize for IsCompleteStatus {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            IsCompleteStatus::Complete => serializer.serialize_str("complete"),
+            IsCompleteStatus::Incomplete => serializer.serialize_str("incomplete"),
+            IsCompleteStatus::Invalid => serializer.serialize_str("invalid"),
+            IsCompleteStatus::Unknown => serializer.serialize_str("unknown"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ErrorReply<'a> {
     pub(crate) exception_name: Cow<'a, str>,

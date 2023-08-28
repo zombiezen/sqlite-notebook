@@ -7,23 +7,26 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.75"
+chrono = { version = "0.4.26", features = ["serde"] }
 clap = { version = "4.4.0", features = ["derive"] }
 hex = { version = "0.4.3", features = ["serde"] }
-zombiezen-zmq = { path = "./zombiezen-zmq" }
+hmac = "0.12.1"
+rand = "0.8.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-hmac = "0.12.1"
 sha2 = "0.10.7"
-uuid = "1.4.1"
-rand = "0.8.5"
-chrono = { version = "0.4.26", features = ["serde"] }
+tempdir = "0.3.7"
 tracing = "0.1.37"
 tracing-subscriber = "0.3.17"
+uuid = "1.4.1"
+zombiezen-sqlite = { path = "./zombiezen-sqlite" }
+zombiezen-zmq = { path = "./zombiezen-zmq" }
 
 [workspace]
 
 members = [
   ".",
   "libzmq-sys",
+  "zombiezen-sqlite",
   "zombiezen-zmq",
 ]

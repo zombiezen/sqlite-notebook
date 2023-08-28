@@ -13,6 +13,7 @@ use serde::de::Visitor;
 use serde::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tempdir::TempDir;
 use tracing::debug;
 use tracing::error;
 use tracing::trace_span;
@@ -20,6 +21,8 @@ use tracing::Level;
 use tracing::{debug_span, field, info};
 use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Builder as UuidBuilder;
+use zombiezen_sqlite::Connection;
+use zombiezen_sqlite::OpenFlags;
 use zombiezen_zmq::{
     Context as ZeroMQContext, Errno, Events, PollItem, RecvFlags, SendFlags, Socket,
 };
@@ -113,6 +116,19 @@ fn run(args: Args) -> Result<()> {
         id.as_hyphenated().to_string()
     };
     debug!(session_id = session_id, "Generated session ID");
+    let (_database_directory, mut conn) = {
+        let span = debug_span!("sqlite3_open", path = field::Empty);
+        let _enter = span.enter();
+        let dir = TempDir::new("sqlite-notebook")?;
+        let db_path = dir.path().join("database.sqlite");
+        span.record("path", db_path.to_string_lossy().as_ref());
+        let conn = Connection::open(
+            // TODO(now): There should be better ways to do this.
+            CString::new(db_path.to_str().unwrap())?,
+            OpenFlags::default(),
+        )?;
+        (dir, conn)
+    };
 
     let connection_file_data = fs::read(&args.connection_file)?;
     debug!(
@@ -157,6 +173,7 @@ fn run(args: Args) -> Result<()> {
 
     let zmq_version = zombiezen_zmq::version();
     info!(
+        sqlite.version = zombiezen_sqlite::version(),
         zeromq.major = zmq_version.0,
         zeromq.minor = zmq_version.1,
         zeromq.patch = zmq_version.2,
@@ -195,6 +212,7 @@ fn run(args: Args) -> Result<()> {
                     &session_id,
                     &config.as_auth(),
                     &mut execution_counter,
+                    &mut conn,
                     &mut shell_socket,
                     &mut io_pub_socket,
                 )?,
@@ -208,6 +226,7 @@ fn handle_shell<S, K>(
     session_id: &str,
     auth: &wire::Authentication<S, K>,
     execution_counter: &mut i32,
+    conn: &mut Connection,
     shell_socket: &mut Socket,
     io_pub_socket: &mut Socket,
 ) -> Result<()>
@@ -226,7 +245,14 @@ where
 
     match hdr.r#type.as_str() {
         "execute_request" => {
-            match execute(session_id, auth, execution_counter, &message, io_pub_socket) {
+            match execute(
+                session_id,
+                auth,
+                execution_counter,
+                conn,
+                &message,
+                io_pub_socket,
+            ) {
                 Ok(response) => reply(
                     session_id,
                     auth,
@@ -248,6 +274,11 @@ where
             }
         }
         "kernel_info_request" => {
+            let version = zombiezen_sqlite::version();
+            let banner = format!(
+                "SQLite version {}\nEnter \".help\" for usage hints.",
+                version
+            );
             reply(
                 session_id,
                 auth,
@@ -263,24 +294,43 @@ where
 
                     "language_info": {
                         "name": "sql",
+                        "version": version,
                         "mimetype": "application/sql",
                         "file_extension": ".sql",
                     },
+
+                    "banner": &banner,
                 }),
             )?;
         }
         "is_complete_request" => {
-            reply(
-                session_id,
-                auth,
-                shell_socket,
-                "is_complete_reply",
-                message.identities().iter().copied(),
-                message.raw_header(),
-                &json!({
-                    "status": "unknown",
-                }),
-            )?;
+            let message_content = message.deserialize_content::<wire::IsCompleteRequest>();
+            let result = message_content
+                .map_err(|err| wire::ErrorReply {
+                    exception_value: err.to_string().into(),
+                    ..wire::ErrorReply::new("ValueError")
+                })
+                .and_then(|request| is_complete(&request));
+            match result {
+                Ok(response) => reply(
+                    session_id,
+                    auth,
+                    shell_socket,
+                    "is_complete_reply",
+                    message.identities().iter().copied(),
+                    message.raw_header(),
+                    &response,
+                )?,
+                Err(err) => reply(
+                    session_id,
+                    auth,
+                    shell_socket,
+                    "is_complete_reply",
+                    message.identities().iter().copied(),
+                    message.raw_header(),
+                    &err,
+                )?,
+            }
         }
         _ => {
             if let Some(base) = hdr.r#type.strip_suffix("_request") {
@@ -314,6 +364,7 @@ fn execute<S, K, P>(
     session_id: &str,
     auth: &wire::Authentication<S, K>,
     execution_counter: &mut i32,
+    conn: &mut Connection,
     message: &wire::Message<P>,
     io_pub_socket: &mut Socket,
 ) -> Result<wire::ExecuteReply, wire::ErrorReply<'static>>
@@ -381,6 +432,9 @@ where
         ..wire::ErrorReply::new("IOError")
     })?;
 
+    // TODO(now)
+    conn.prepare(&req_content.code);
+
     reply(
         session_id,
         auth,
@@ -421,6 +475,31 @@ where
         execution_count,
         user_expressions: HashMap::new(),
     })
+}
+
+fn is_complete(
+    request: &wire::IsCompleteRequest,
+) -> Result<wire::IsCompleteReply, wire::ErrorReply<'static>> {
+    let code = match CString::new(request.code.as_bytes()) {
+        Ok(code) => code,
+        Err(_) => {
+            return Ok(wire::IsCompleteReply {
+                status: wire::IsCompleteStatus::Invalid,
+                indent: None,
+            });
+        }
+    };
+    if zombiezen_sqlite::is_complete(&code) {
+        Ok(wire::IsCompleteReply {
+            status: wire::IsCompleteStatus::Complete,
+            indent: None,
+        })
+    } else {
+        Ok(wire::IsCompleteReply {
+            status: wire::IsCompleteStatus::Incomplete,
+            indent: Some("  ".to_string()),
+        })
+    }
 }
 
 fn reply<S, K>(
