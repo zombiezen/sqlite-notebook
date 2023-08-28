@@ -9,20 +9,13 @@ use std::process::exit;
 use anyhow::Result;
 use clap::Parser as ClapParser;
 use rand::{thread_rng, RngCore};
-use serde::de::Visitor;
-use serde::Deserializer;
-use serde::{Deserialize, Serialize};
+use serde::{de::Visitor, Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use tempdir::TempDir;
-use tracing::debug;
-use tracing::error;
-use tracing::trace_span;
-use tracing::Level;
-use tracing::{debug_span, field, info};
+use tracing::{debug, debug_span, error, field, info, trace_span, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Builder as UuidBuilder;
-use zombiezen_sqlite::Connection;
-use zombiezen_sqlite::OpenFlags;
+use zombiezen_sqlite::{Connection, OpenFlags, StepResult};
 use zombiezen_zmq::{
     Context as ZeroMQContext, Errno, Events, PollItem, RecvFlags, SendFlags, Socket,
 };
@@ -171,12 +164,13 @@ fn run(args: Args) -> Result<()> {
         config.transport, config.ip, config.shell_port
     ))?))?;
 
-    let zmq_version = zombiezen_zmq::version();
+    let zmq_version = {
+        let (major, minor, patch) = zombiezen_zmq::version();
+        format!("{}.{}.{}", major, minor, patch)
+    };
     info!(
         sqlite.version = zombiezen_sqlite::version(),
-        zeromq.major = zmq_version.0,
-        zeromq.minor = zmq_version.1,
-        zeromq.patch = zmq_version.2,
+        zeromq.version = &zmq_version,
         "Kernel ready",
     );
     let mut execution_counter = 0i32;
@@ -432,55 +426,155 @@ where
         ..wire::ErrorReply::new("IOError")
     })?;
 
-    // TODO(now)
-    conn.prepare(&req_content.code);
+    match run_code(conn, &req_content.code) {
+        Ok((plain, html)) => {
+            let data = if plain.is_empty() && html.is_empty() {
+                let _ = reply(
+                    session_id,
+                    auth,
+                    io_pub_socket,
+                    "clear_output",
+                    iter::empty::<Vec<u8>>(),
+                    message.raw_header(),
+                    &json!({
+                        "wait": false,
+                    }),
+                );
+                json!({})
+            } else {
+                json!({"text/plain": plain, "text/html": html})
+            };
+            reply(
+                session_id,
+                auth,
+                io_pub_socket,
+                "execute_result",
+                iter::empty::<Vec<u8>>(),
+                message.raw_header(),
+                &json!({
+                    "execution_count": execution_count,
+                    "data": data,
+                    "metadata": {},
+                }),
+            )
+            .map_err(|err| wire::ErrorReply {
+                exception_value: err.to_string().into(),
+                execution_count: Some(execution_count),
+                ..wire::ErrorReply::new("IOError")
+            })?;
 
-    reply(
-        session_id,
-        auth,
-        io_pub_socket,
-        "stream",
-        iter::empty::<Vec<u8>>(),
-        message.raw_header(),
-        &json!({
-            "name": "stdout",
-            "text": "hello, world!\n",
-        }),
-    )
-    .map_err(|err| wire::ErrorReply {
-        exception_value: err.to_string().into(),
-        execution_count: Some(execution_count),
-        ..wire::ErrorReply::new("IOError")
-    })?;
-    reply(
-        session_id,
-        auth,
-        io_pub_socket,
-        "execute_result",
-        iter::empty::<Vec<u8>>(),
-        message.raw_header(),
-        &json!({
-            "execution_count": execution_count,
-            "data": {"text/plain": "result!"},
-            "metadata": {},
-        }),
-    )
-    .map_err(|err| wire::ErrorReply {
-        exception_value: err.to_string().into(),
-        execution_count: Some(execution_count),
-        ..wire::ErrorReply::new("IOError")
-    })?;
+            Ok(wire::ExecuteReply {
+                execution_count,
+                user_expressions: HashMap::new(),
+            })
+        }
+        Err((base_offset, err)) => {
+            let err_string = err.to_string();
+            let traceback = if let Some(off) = err.error_offset() {
+                let (lineno, col) = str_position(&req_content.code, base_offset + off);
+                format!("{}:{}: {}", lineno, col, &err_string)
+            } else {
+                err_string.clone()
+            };
+            let err_reply = wire::ErrorReply {
+                execution_count: Some(execution_count),
+                traceback: vec![traceback.into()],
+                exception_value: err_string.into(),
+                ..wire::ErrorReply::new(format!("{:?}", err.result_code()))
+            };
+            let _ = reply(
+                session_id,
+                auth,
+                io_pub_socket,
+                "error",
+                iter::empty::<Vec<u8>>(),
+                message.raw_header(),
+                &json!({
+                    "ename": err_reply.exception_name.clone(),
+                    "evalue": err_reply.exception_value.clone(),
+                    "traceback": err_reply.traceback.clone(),
+                }),
+            );
 
-    Ok(wire::ExecuteReply {
-        execution_count,
-        user_expressions: HashMap::new(),
-    })
+            Err(err_reply)
+        }
+    }
+}
+
+fn run_code(
+    conn: &mut Connection,
+    mut code: &str,
+) -> Result<(String, String), (usize, zombiezen_sqlite::Error)> {
+    let mut plain_result = String::new();
+    let mut html_result = String::new();
+    let orig_size = code.len();
+    let map_err = |err| (orig_size - code.len(), err);
+    let mut first_select = true;
+    while !code.is_empty() {
+        let (mut stmt, tail) = match conn.prepare(code).map_err(map_err)? {
+            Some(x) => x,
+            None => break,
+        };
+
+        let column_count = stmt.column_count();
+        if column_count > 0 {
+            html_result.push_str("<table>\n<thead><tr>");
+            for i in 0..column_count {
+                let name = stmt.column_name(i).unwrap();
+                html_result.push_str("<th scope=\"col\">");
+                escape_html(&mut html_result, &name);
+                html_result.push_str("</th>");
+            }
+            html_result.push_str("</tr></thead>\n<tbody>\n");
+
+            if !first_select {
+                plain_result.push_str("\n");
+            }
+        }
+        loop {
+            match stmt.step().map_err(map_err)? {
+                StepResult::Done => break,
+                StepResult::Row => {
+                    html_result.push_str("<tr>");
+                    for i in 0..column_count {
+                        let val = String::from_utf8_lossy(
+                            stmt.column_blob(i).expect("column should be in range"),
+                        );
+
+                        html_result.push_str("<td>");
+                        escape_html(&mut html_result, &val);
+                        html_result.push_str("</td>");
+
+                        if i > 0 {
+                            plain_result.push_str("|");
+                        }
+                        plain_result.push_str(&val);
+                    }
+                    html_result.push_str("</tr>\n");
+                    plain_result.push_str("\n");
+                }
+            }
+        }
+        if column_count > 0 {
+            html_result.push_str("</tbody></table>\n");
+            first_select = false;
+        }
+        code = tail;
+    }
+    Ok((plain_result, html_result))
 }
 
 fn is_complete(
     request: &wire::IsCompleteRequest,
 ) -> Result<wire::IsCompleteReply, wire::ErrorReply<'static>> {
-    let code = match CString::new(request.code.as_bytes()) {
+    let code = request.code.as_bytes();
+    let mut buf = Vec::with_capacity(code.len() + 2);
+    buf.extend(code);
+    if !code.ends_with(b";") {
+        buf.push(b';');
+    }
+    buf.push(0);
+    let code = match CString::from_vec_with_nul(buf) {
         Ok(code) => code,
         Err(_) => {
             return Ok(wire::IsCompleteReply {
@@ -570,4 +664,36 @@ where
 fn drain_socket(socket: &mut Socket) {
     let mut buf = [0u8; 4096];
     let _ = socket.recv(&mut buf, RecvFlags::default());
+}
+
+fn str_position(s: &str, off: usize) -> (usize, usize) {
+    let mut lineno = 1;
+    let mut col = 1;
+    for c in s[..off].chars() {
+        // TODO(soon): Tabs.
+        match c {
+            '\n' => {
+                lineno += 1;
+                col = 1;
+            }
+            _ => {
+                col += 1;
+            }
+        }
+    }
+    (lineno, col)
+}
+
+fn escape_html(dst: &mut String, s: &str) {
+    dst.reserve(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => dst.push_str("&amp;"),
+            '<' => dst.push_str("&lt;"),
+            '>' => dst.push_str("&gt;"),
+            '\'' => dst.push_str("&#39;"),
+            '"' => dst.push_str("&#34;"),
+            _ => dst.push(c),
+        }
+    }
 }

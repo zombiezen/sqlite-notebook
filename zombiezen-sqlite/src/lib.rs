@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr::{null, NonNull};
 use std::slice;
-use std::str;
+use std::str::{self, Utf8Error};
 
 mod result;
 
@@ -11,7 +11,8 @@ pub use result::*;
 
 use bitflags::bitflags;
 use libsqlite3_sys::{
-    sqlite3, sqlite3_close, sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_name,
+    sqlite3, sqlite3_clear_bindings, sqlite3_close, sqlite3_column_blob, sqlite3_column_bytes,
+    sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64, sqlite3_column_name,
     sqlite3_column_text, sqlite3_column_type, sqlite3_complete, sqlite3_db_handle,
     sqlite3_finalize, sqlite3_libversion, sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_reset,
     sqlite3_step, sqlite3_stmt, SQLITE_BLOB, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER,
@@ -119,7 +120,10 @@ impl<'c> Statement<'c> {
                 self.has_row = false;
                 Ok(StepResult::Done)
             }
-            _ => Err(self.error().unwrap()),
+            _ => {
+                self.has_row = false;
+                Err(self.error().unwrap())
+            }
         }
     }
 
@@ -130,6 +134,12 @@ impl<'c> Statement<'c> {
         match rc {
             ResultCode::OK => Ok(()),
             _ => Err(self.error().unwrap()),
+        }
+    }
+
+    pub fn clear_bindings(&mut self) {
+        unsafe {
+            sqlite3_clear_bindings(self.ptr.as_ptr());
         }
     }
 
@@ -163,16 +173,47 @@ impl<'c> Statement<'c> {
         ColumnType::from_int(unsafe { sqlite3_column_type(self.ptr.as_ptr(), i as c_int) })
     }
 
-    pub fn column_text(&mut self, i: usize) -> Option<&str> {
+    pub fn column_i64(&mut self, i: usize) -> Option<i64> {
+        if i >= self.column_count() || !self.has_row {
+            return None;
+        }
+        Some(unsafe { sqlite3_column_int64(self.ptr.as_ptr(), i as c_int) })
+    }
+
+    pub fn column_f64(&mut self, i: usize) -> Option<f64> {
+        if i >= self.column_count() || !self.has_row {
+            return None;
+        }
+        Some(unsafe { sqlite3_column_double(self.ptr.as_ptr(), i as c_int) })
+    }
+
+    pub fn column_text(&mut self, i: usize) -> Option<Result<&str, Utf8Error>> {
         if i >= self.column_count() || !self.has_row {
             return None;
         }
         let bytes = unsafe {
             let ptr = sqlite3_column_text(self.ptr.as_ptr(), i as c_int);
+            if ptr.is_null() {
+                return Some(Ok(""));
+            }
             let n = sqlite3_column_bytes(self.ptr.as_ptr(), i as c_int);
             slice::from_raw_parts(ptr, n as usize)
         };
-        str::from_utf8(bytes).ok()
+        Some(str::from_utf8(bytes))
+    }
+
+    pub fn column_blob(&mut self, i: usize) -> Option<&[u8]> {
+        if i >= self.column_count() || !self.has_row {
+            return None;
+        }
+        Some(unsafe {
+            let ptr = sqlite3_column_blob(self.ptr.as_ptr(), i as c_int);
+            if ptr.is_null() {
+                return Some(b"");
+            }
+            let n = sqlite3_column_bytes(self.ptr.as_ptr(), i as c_int);
+            slice::from_raw_parts(ptr as *const u8, n as usize)
+        })
     }
 }
 
@@ -281,5 +322,27 @@ mod tests {
             Connection::open(&CString::new(":memory:").unwrap(), OpenFlags::default()).unwrap();
         let result = conn.prepare("").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_values() {
+        let conn =
+            Connection::open(&CString::new(":memory:").unwrap(), OpenFlags::default()).unwrap();
+        let (mut stmt, _) = conn
+            .prepare("select 123 as \"int\", 'foo' as \"text\";")
+            .unwrap()
+            .expect("statement is not empty");
+        assert_eq!(stmt.column_count(), 2);
+        assert_eq!(stmt.column_name(0), Some(String::from("int")));
+        assert_eq!(stmt.column_name(1), Some(String::from("text")));
+        assert_eq!(stmt.column_name(2), None);
+
+        assert_eq!(stmt.step().unwrap(), StepResult::Row);
+        assert_eq!(stmt.column_type(0), Some(ColumnType::Integer));
+        assert_eq!(stmt.column_i64(0), Some(123));
+        assert_eq!(stmt.column_type(1), Some(ColumnType::Text));
+        assert_eq!(stmt.column_text(1), Some("foo"));
+
+        assert_eq!(stmt.step().unwrap(), StepResult::Done);
     }
 }

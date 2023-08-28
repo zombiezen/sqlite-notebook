@@ -305,6 +305,7 @@ pub(crate) struct ErrorReply<'a> {
     pub(crate) exception_name: Cow<'a, str>,
     pub(crate) exception_value: Cow<'a, str>,
     pub(crate) execution_count: Option<i32>,
+    pub(crate) traceback: Vec<Cow<'a, str>>,
 }
 
 impl<'a> ErrorReply<'a> {
@@ -314,6 +315,7 @@ impl<'a> ErrorReply<'a> {
             exception_name: name.into(),
             exception_value: "".into(),
             execution_count: None,
+            traceback: Vec::new(),
         }
     }
 }
@@ -323,7 +325,7 @@ impl<'a> Serialize for ErrorReply<'a> {
     where
         S: serde::Serializer,
     {
-        let field_count = 2
+        let field_count = 3
             + (!self.exception_value.is_empty() as usize)
             + (self.execution_count.is_some() as usize);
         let mut serializer = serializer.serialize_map(Some(field_count))?;
@@ -335,6 +337,7 @@ impl<'a> Serialize for ErrorReply<'a> {
         if let Some(n) = self.execution_count {
             serializer.serialize_entry("execution_count", &n)?;
         }
+        serializer.serialize_entry("traceback", &self.traceback)?;
         serializer.end()
     }
 }
