@@ -9,7 +9,7 @@ use csv::{Writer as CsvWriter, WriterBuilder as CsvWriterBuilder};
 use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::json;
 use tracing::{debug_span, field};
-use zombiezen_sqlite::{Connection, StepResult};
+use zombiezen_sqlite::{ColumnType, Connection, StepResult};
 use zombiezen_zmq::Socket;
 
 use crate::{reply, wire};
@@ -247,20 +247,52 @@ fn run_code(
                 StepResult::Row => {
                     result.html.push_str("<tr>");
                     for i in 0..column_count {
-                        let val = stmt.column_text(i).map_or_else(
-                            |err| String::from_utf8_lossy(err.as_bytes()),
-                            |s| s.into(),
-                        );
-
-                        let _ = write!(&mut result.html, "<td>{}</td>", EscapeHtml(&val));
-
                         if i > 0 {
                             result.plain.push_str("|");
                         }
-                        result.plain.push_str(&val);
+                        match stmt.column_type(i) {
+                            ColumnType::Null => result.html.push_str("<td><code>NULL</code></td>"),
+                            ColumnType::Blob => {
+                                let bytes = stmt.column_blob(i);
+                                let hex = hex::encode_upper(bytes);
+                                match std::str::from_utf8(bytes) {
+                                    Ok(s) if s.chars().all(|c| !c.is_control()) => {
+                                        let _ = write!(
+                                            &mut result.html,
+                                            "<td><code>{}</code></td>",
+                                            EscapeHtml(s)
+                                        );
+                                        result.plain.push_str(s);
+                                    }
+                                    _ => {
+                                        let _ = write!(
+                                            &mut result.html,
+                                            "<td><i>{}-byte <code>BLOB</code></i></td>",
+                                            bytes.len()
+                                        );
+                                        result.plain.push_str(&hex);
+                                    }
+                                }
+
+                                result.csv.write_field(hex.as_bytes()).unwrap();
+                            }
+                            _ => {
+                                let val = stmt.column_text(i).map_or_else(
+                                    |err| String::from_utf8_lossy(err.as_bytes()),
+                                    |s| s.into(),
+                                );
+
+                                let _ = write!(&mut result.html, "<td>{}</td>", EscapeHtml(&val));
+
+                                result.plain.push_str(&val);
+
+                                result.csv.write_field(val.as_bytes()).unwrap();
+                            }
+                        }
                     }
                     result.html.push_str("</tr>\n");
                     result.plain.push_str("\n");
+                    result.csv.write_record(None::<&[u8]>).unwrap();
                 }
             }
         }
@@ -283,7 +315,7 @@ fn process_dot_command(
         Ok(line) => line,
         Err(err) => {
             let err_str = err.to_string();
-            let _ = writeln!(&mut result.stderr, "line {}: {}", lineno, &err_str);
+            let _ = writeln!(&mut result.stderr, "line {lineno}: {}", &err_str);
             return Ok(());
         }
     };
@@ -310,8 +342,8 @@ fn process_dot_command(
         _ => {
             let _ = writeln!(
                 &mut result.stderr,
-                "line {}: unknown dot command {}",
-                lineno, &line.name
+                "line {lineno}: unknown dot command {}",
+                &line.name
             );
         }
     }
