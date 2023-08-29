@@ -1,7 +1,7 @@
 { rustPlatform
+, lib
 , nix-gitignore
 , jq
-, openssl
 , sqlite
 , zeromq
 , pkg-config
@@ -23,7 +23,6 @@ let pname = "sqlite-notebook"; in rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
 
   buildInputs = [
-    openssl.dev
     sqlite.dev
     zeromq
   ];
@@ -40,6 +39,13 @@ let pname = "sqlite-notebook"; in rustPlatform.buildRustPackage {
   '';
 
   passthru = {
-    inherit openssl sqlite zeromq;
+    inherit sqlite zeromq;
+  };
+
+  meta = {
+    description = "A Jupyter kernel for SQLite";
+    homepage = "https://github.com/zombiezen/sqlite-notebook";
+    license = lib.licenses.asl20;
+    maintainers = [ lib.maintainers.zombiezen ];
   };
 }
