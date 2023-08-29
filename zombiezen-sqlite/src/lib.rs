@@ -112,6 +112,8 @@ impl Drop for Connection {
     }
 }
 
+/// A single SQL statement that has been compiled into binary form
+/// and is ready to be evaluated.
 #[derive(Debug)]
 pub struct Statement<'c> {
     ptr: NonNull<sqlite3_stmt>,
@@ -125,6 +127,10 @@ impl<'c> Statement<'c> {
         db.and_then(|db| Error::get(db))
     }
 
+    /// Evaluate the statement, stopping at the next row returned.
+    /// Once [`StepResult::Done`] is returned,
+    /// the statement has finished executing successfully
+    /// and `step` should not be called again without first calling [`reset`].
     pub fn step(&mut self) -> Result<StepResult> {
         let rc = ResultCode(unsafe { sqlite3_step(self.ptr.as_ptr()) });
         match rc {
@@ -143,7 +149,13 @@ impl<'c> Statement<'c> {
         }
     }
 
-    /// Resets the prepared statement to its initial state.
+    /// Resets the prepared statement to its initial state,
+    /// returning an error if the previous evaluation of the statement
+    /// did not complete successfully.
+    /// Even if there were no previous errors, `reset` may still return an error
+    /// in the case that a new error was caused by resetting the statement.
+    ///
+    /// This does not change the bindings: use [`clear_bindings`] to do that.
     pub fn reset(&mut self) -> Result<()> {
         self.has_row = false;
         let rc = ResultCode(unsafe { sqlite3_reset(self.ptr.as_ptr()) });
@@ -159,10 +171,16 @@ impl<'c> Statement<'c> {
         }
     }
 
+    /// Returns the number of columns in the result set returned by the statement.
+    /// If `column_count` returns 0, then the statement returns no data.
     pub fn column_count(&self) -> usize {
         (unsafe { sqlite3_column_count(self.ptr.as_ptr()) }) as usize
     }
 
+    /// Returns the name assigned to a particular column using the "AS" clause.
+    /// The leftmost column is number 0.
+    /// Will be `None` if `i >= self.column_count()`
+    /// or SQLite failed to allocate the column name.
     pub fn column_name(&self, i: usize) -> Option<String> {
         if i >= self.column_count() {
             return None;
@@ -182,60 +200,156 @@ impl<'c> Statement<'c> {
         }
     }
 
-    pub fn column_type(&self, i: usize) -> Option<ColumnType> {
-        if i >= self.column_count() || !self.has_row {
-            return None;
-        }
+    fn check_col(&self, i: usize) {
+        assert!(self.has_row);
+        let n = self.column_count();
+        assert!(i < n, "{} >= column_count={}", i, n);
+    }
+
+    /// Returns the datatype of the value in the `i`th column.
+    /// The leftmost column is number 0.
+    /// The return value is undefined after calling any of
+    /// [`column_i64`], [`column_f64`], [`column_text`], or [`column_blob`]
+    /// on the column, as these can all perform conversions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the statement has not returned a row
+    /// or if `i >= self.column_count()`.
+    pub fn column_type(&self, i: usize) -> ColumnType {
+        self.check_col(i);
         ColumnType::from_int(unsafe { sqlite3_column_type(self.ptr.as_ptr(), i as c_int) })
+            .expect("SQLite returned an unknown column type")
     }
 
-    pub fn column_i64(&mut self, i: usize) -> Option<i64> {
-        if i >= self.column_count() || !self.has_row {
-            return None;
-        }
-        Some(unsafe { sqlite3_column_int64(self.ptr.as_ptr(), i as c_int) })
+    /// Returns the value in the `i`th column as 64-bit integer,
+    /// [converting it] if necessary.
+    /// The leftmost column is number 0.
+    ///
+    /// [converting it]: https://www.sqlite.org/c3ref/column_blob.html
+    ///
+    /// # Panics
+    ///
+    /// Panics if the statement has not returned a row
+    /// or if `i >= self.column_count()`.
+    pub fn column_i64(&mut self, i: usize) -> i64 {
+        self.check_col(i);
+        unsafe { sqlite3_column_int64(self.ptr.as_ptr(), i as c_int) }
     }
 
-    pub fn column_f64(&mut self, i: usize) -> Option<f64> {
-        if i >= self.column_count() || !self.has_row {
-            return None;
-        }
-        Some(unsafe { sqlite3_column_double(self.ptr.as_ptr(), i as c_int) })
+    /// Returns the value in the `i`th column as 64-bit floating point number,
+    /// [converting it] if necessary.
+    /// The leftmost column is number 0.
+    ///
+    /// [converting it]: https://www.sqlite.org/c3ref/column_blob.html
+    ///
+    /// # Panics
+    ///
+    /// Panics if the statement has not returned a row
+    /// or if `i >= self.column_count()`.
+    pub fn column_f64(&mut self, i: usize) -> f64 {
+        self.check_col(i);
+        unsafe { sqlite3_column_double(self.ptr.as_ptr(), i as c_int) }
     }
 
-    pub fn column_text(&mut self, i: usize) -> Option<Result<&str, ColumnTextError>> {
-        if i >= self.column_count() || !self.has_row {
-            return None;
-        }
+    /// Returns the value in the `i`th column as `TEXT` (a UTF-8 string),
+    /// [converting it] if necessary.
+    /// The leftmost column is number 0.
+    ///
+    /// [converting it]: https://www.sqlite.org/c3ref/column_blob.html
+    ///
+    /// # Errors
+    ///
+    /// If the column contains [invalid UTF-8],
+    /// then `column_text` returns a [`ColumnTextError`].
+    /// This can be used to retrieve the returned byte slice,
+    /// which you can use to pass to [`String::from_utf8_lossy`] for example:
+    ///
+    /// ```rust
+    /// use std::borrow::Cow;
+    /// # use std::ffi::CString;
+    /// # use zombiezen_sqlite::{Connection, OpenFlags, StepResult};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// #     let conn = Connection::open(
+    /// #         &CString::new(":memory:")?,
+    /// #         OpenFlags::default(),
+    /// #     )?;
+    /// #     let (mut stmt, _) = conn.prepare("values ('Hello, World!');")?.unwrap();
+    /// #     assert_eq!(stmt.step()?, StepResult::Row);
+    /// let s: Cow<str> = stmt.column_text(0).map_or_else(
+    ///     |err| String::from_utf8_lossy(err.as_bytes()),
+    ///     |s| s.into(),
+    /// );
+    /// #     assert_eq!(s, "Hello, World!");
+    /// #     Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [invalid UTF-8]: https://www.sqlite.org/invalidutf.html
+    /// [`String::from_utf8_lossy`]: https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf8_lossy
+    ///
+    /// # Panics
+    ///
+    /// Panics if the statement has not returned a row
+    /// or if `i >= self.column_count()`.
+    pub fn column_text(&mut self, i: usize) -> Result<&str, ColumnTextError> {
+        self.check_col(i);
         let bytes = unsafe {
             let ptr = sqlite3_column_text(self.ptr.as_ptr(), i as c_int);
             if ptr.is_null() {
-                return Some(Ok(""));
+                return Ok("");
             }
             let n = sqlite3_column_bytes(self.ptr.as_ptr(), i as c_int);
             slice::from_raw_parts(ptr, n as usize)
         };
-        Some(str::from_utf8(bytes).map_err(|err| ColumnTextError { bytes, err }))
+        str::from_utf8(bytes).map_err(|err| ColumnTextError { bytes, err })
     }
 
-    pub fn column_blob(&mut self, i: usize) -> Option<&[u8]> {
-        if i >= self.column_count() || !self.has_row {
-            return None;
-        }
-        Some(unsafe {
+    /// Returns the value in the `i`th column as a `BLOB` (byte slice),
+    /// [converting it] if necessary.
+    /// The leftmost column is number 0.
+    ///
+    /// [converting it]: https://www.sqlite.org/c3ref/column_blob.html
+    ///
+    /// # Panics
+    ///
+    /// Panics if the statement has not returned a row
+    /// or if `i >= self.column_count()`.
+    pub fn column_blob(&mut self, i: usize) -> &[u8] {
+        self.check_col(i);
+        unsafe {
             let ptr = sqlite3_column_blob(self.ptr.as_ptr(), i as c_int);
             if ptr.is_null() {
-                return Some(b"");
+                return b"";
             }
             let n = sqlite3_column_bytes(self.ptr.as_ptr(), i as c_int);
             slice::from_raw_parts(ptr as *const u8, n as usize)
-        })
+        }
+    }
+
+    /// Releases any resources associated with the statement
+    /// and returns any error from the most recent evaluation of the statement.
+    /// Even if there were no previous errors, `finalize` may still return an error
+    /// in the case that a new error was caused by finalizing the statement.
+    ///
+    /// Calling `finalize` is equivalent to `Drop`ping the statement,
+    /// but allows the error to be inspected.
+    pub fn finalize(mut self) -> Result<()> {
+        self.finalize_internal()
+    }
+
+    fn finalize_internal(&mut self) -> Result<()> {
+        if ResultCode(unsafe { sqlite3_finalize(self.ptr.as_ptr()) }).is_success() {
+            Ok(())
+        } else {
+            Err(self.error().expect("sqlite3_finalize returned an error"))
+        }
     }
 }
 
 impl<'c> Drop for Statement<'c> {
     fn drop(&mut self) {
-        unsafe { sqlite3_finalize(self.ptr.as_ptr()) };
+        let _ = self.finalize_internal();
     }
 }
 
@@ -294,7 +408,7 @@ impl Default for OpenFlags {
     }
 }
 
-/// Codes for each of the SQLite fundamental datatypes.
+/// Enumeration of the SQLite fundamental datatypes.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ColumnType {
@@ -388,10 +502,10 @@ mod tests {
         assert_eq!(stmt.column_name(2), None);
 
         assert_eq!(stmt.step().unwrap(), StepResult::Row);
-        assert_eq!(stmt.column_type(0), Some(ColumnType::Integer));
-        assert_eq!(stmt.column_i64(0), Some(123));
-        assert_eq!(stmt.column_type(1), Some(ColumnType::Text));
-        assert_eq!(stmt.column_text(1).unwrap().unwrap(), "foo");
+        assert_eq!(stmt.column_type(0), ColumnType::Integer);
+        assert_eq!(stmt.column_i64(0), 123);
+        assert_eq!(stmt.column_type(1), ColumnType::Text);
+        assert_eq!(stmt.column_text(1).unwrap(), "foo");
 
         assert_eq!(stmt.step().unwrap(), StepResult::Done);
     }

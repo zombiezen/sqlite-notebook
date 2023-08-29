@@ -247,13 +247,10 @@ fn run_code(
                 StepResult::Row => {
                     result.html.push_str("<tr>");
                     for i in 0..column_count {
-                        let val = stmt
-                            .column_text(i)
-                            .expect("column should be in range")
-                            .map_or_else(
-                                |err| String::from_utf8_lossy(err.as_bytes()),
-                                |s| s.into(),
-                            );
+                        let val = stmt.column_text(i).map_or_else(
+                            |err| String::from_utf8_lossy(err.as_bytes()),
+                            |s| s.into(),
+                        );
 
                         let _ = write!(&mut result.html, "<td>{}</td>", EscapeHtml(&val));
 
@@ -300,7 +297,7 @@ fn process_dot_command(
                 match stmt.step()? {
                     StepResult::Done => break,
                     StepResult::Row => {
-                        let sql = stmt.column_text(0).unwrap().map_or_else(
+                        let sql = stmt.column_text(0).map_or_else(
                             |err| String::from_utf8_lossy(err.as_bytes()),
                             |s| s.into(),
                         );
