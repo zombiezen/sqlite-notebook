@@ -21,6 +21,8 @@
           program = "${self.packages.${system}.default}/bin/sqlite-notebook";
         };
 
+        checks.package = self.packages.${system}.default;
+
         devShells.default = pkgs.mkShell {
           inputsFrom = [self.packages.${system}.default];
 
