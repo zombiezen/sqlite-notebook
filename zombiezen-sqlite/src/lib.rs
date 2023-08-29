@@ -1,9 +1,9 @@
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::ptr::{null, NonNull};
-use std::slice;
+use std::ptr::{self, null, NonNull};
 use std::str::{self, Utf8Error};
+use std::{fmt, slice};
 
 mod result;
 
@@ -13,12 +13,13 @@ use bitflags::bitflags;
 use libsqlite3_sys::{
     sqlite3, sqlite3_clear_bindings, sqlite3_close, sqlite3_column_blob, sqlite3_column_bytes,
     sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64, sqlite3_column_name,
-    sqlite3_column_text, sqlite3_column_type, sqlite3_complete, sqlite3_db_handle,
-    sqlite3_finalize, sqlite3_libversion, sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_reset,
-    sqlite3_step, sqlite3_stmt, SQLITE_BLOB, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER,
-    SQLITE_NOMEM, SQLITE_NULL, SQLITE_OPEN_CREATE, SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY,
-    SQLITE_OPEN_NOMUTEX, SQLITE_OPEN_READONLY, SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE,
-    SQLITE_OPEN_URI, SQLITE_ROW, SQLITE_TEXT,
+    sqlite3_column_text, sqlite3_column_type, sqlite3_complete, sqlite3_db_config,
+    sqlite3_db_handle, sqlite3_finalize, sqlite3_libversion, sqlite3_open_v2, sqlite3_prepare_v2,
+    sqlite3_reset, sqlite3_step, sqlite3_stmt, SQLITE_BLOB, SQLITE_DBCONFIG_DQS_DDL,
+    SQLITE_DBCONFIG_DQS_DML, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NOMEM, SQLITE_NULL,
+    SQLITE_OPEN_CREATE, SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY, SQLITE_OPEN_NOMUTEX,
+    SQLITE_OPEN_READONLY, SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE, SQLITE_OPEN_URI,
+    SQLITE_ROW, SQLITE_TEXT,
 };
 
 #[repr(transparent)]
@@ -47,7 +48,22 @@ impl Connection {
             }
             return Err(err);
         }
-        Ok(Connection(db))
+        let conn = Connection(db);
+        unsafe {
+            sqlite3_db_config(
+                db.as_ptr(),
+                SQLITE_DBCONFIG_DQS_DML,
+                0 as c_int,
+                ptr::null::<c_void>(),
+            );
+            sqlite3_db_config(
+                db.as_ptr(),
+                SQLITE_DBCONFIG_DQS_DDL,
+                0 as c_int,
+                ptr::null::<c_void>(),
+            );
+        }
+        Ok(conn)
     }
 
     fn error(&self) -> Option<Error> {
@@ -187,7 +203,7 @@ impl<'c> Statement<'c> {
         Some(unsafe { sqlite3_column_double(self.ptr.as_ptr(), i as c_int) })
     }
 
-    pub fn column_text(&mut self, i: usize) -> Option<Result<&str, Utf8Error>> {
+    pub fn column_text(&mut self, i: usize) -> Option<Result<&str, ColumnTextError>> {
         if i >= self.column_count() || !self.has_row {
             return None;
         }
@@ -199,7 +215,7 @@ impl<'c> Statement<'c> {
             let n = sqlite3_column_bytes(self.ptr.as_ptr(), i as c_int);
             slice::from_raw_parts(ptr, n as usize)
         };
-        Some(str::from_utf8(bytes))
+        Some(str::from_utf8(bytes).map_err(|err| ColumnTextError { bytes, err }))
     }
 
     pub fn column_blob(&mut self, i: usize) -> Option<&[u8]> {
@@ -220,6 +236,40 @@ impl<'c> Statement<'c> {
 impl<'c> Drop for Statement<'c> {
     fn drop(&mut self) {
         unsafe { sqlite3_finalize(self.ptr.as_ptr()) };
+    }
+}
+
+/// An error value encountered when a column value contains
+/// [invalid UTF-8](https://www.sqlite.org/invalidutf.html).
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnTextError<'a> {
+    bytes: &'a [u8],
+    err: Utf8Error,
+}
+
+impl<'a> ColumnTextError<'a> {
+    /// Returns a slice of bytes that were attempt to convert to a `&str`.
+    #[inline]
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Fetch a [`Utf8Error`] to get more details about the conversion failure.
+    #[inline]
+    pub fn utf8_error(&self) -> Utf8Error {
+        self.err
+    }
+}
+
+impl<'a> fmt::Display for ColumnTextError<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.err.fmt(f)
+    }
+}
+
+impl<'a> std::error::Error for ColumnTextError<'a> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.err)
     }
 }
 
@@ -341,7 +391,7 @@ mod tests {
         assert_eq!(stmt.column_type(0), Some(ColumnType::Integer));
         assert_eq!(stmt.column_i64(0), Some(123));
         assert_eq!(stmt.column_type(1), Some(ColumnType::Text));
-        assert_eq!(stmt.column_text(1), Some("foo"));
+        assert_eq!(stmt.column_text(1).unwrap().unwrap(), "foo");
 
         assert_eq!(stmt.step().unwrap(), StepResult::Done);
     }

@@ -8,3 +8,7 @@ edition = "2021"
 [dependencies]
 bitflags = "2.4.0"
 libsqlite3-sys = { version = "0.26.0", features = ["buildtime_bindgen"] }
+
+[build-dependencies]
+cc = "1.0.83"
+pkg-config = "0.3.27"

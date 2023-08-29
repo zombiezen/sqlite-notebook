@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt;
 use std::fs;
@@ -12,14 +11,16 @@ use rand::{thread_rng, RngCore};
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use tempdir::TempDir;
+use tracing::warn;
 use tracing::{debug, debug_span, error, field, info, trace_span, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Builder as UuidBuilder;
-use zombiezen_sqlite::{Connection, OpenFlags, StepResult};
+use zombiezen_sqlite::{Connection, OpenFlags};
 use zombiezen_zmq::{
     Context as ZeroMQContext, Errno, Events, PollItem, RecvFlags, SendFlags, Socket,
 };
 
+mod execute;
 mod wire;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -239,7 +240,7 @@ where
 
     match hdr.r#type.as_str() {
         "execute_request" => {
-            match execute(
+            match execute::execute(
                 session_id,
                 auth,
                 execution_counter,
@@ -354,216 +355,6 @@ where
     Ok(())
 }
 
-fn execute<S, K, P>(
-    session_id: &str,
-    auth: &wire::Authentication<S, K>,
-    execution_counter: &mut i32,
-    conn: &mut Connection,
-    message: &wire::Message<P>,
-    io_pub_socket: &mut Socket,
-) -> Result<wire::ExecuteReply, wire::ErrorReply<'static>>
-where
-    S: AsRef<str>,
-    K: AsRef<[u8]>,
-    P: AsRef<[u8]>,
-{
-    let span = debug_span!(
-        "execute",
-        code = field::Empty,
-        execution_count = field::Empty,
-        silent = field::Empty,
-        store_history = field::Empty,
-    );
-
-    let req_content: wire::ExecuteRequest =
-        message
-            .deserialize_content()
-            .map_err(|err| wire::ErrorReply {
-                exception_value: format!("parse request: {}", err).into(),
-                ..wire::ErrorReply::new("ValueError")
-            })?;
-    span.record("code", &req_content.code);
-    span.record("silent", req_content.silent);
-    span.record("store_history", req_content.store_history);
-    let _enter = span.enter();
-
-    reply(
-        session_id,
-        auth,
-        io_pub_socket,
-        "status",
-        iter::empty::<Vec<u8>>(),
-        message.raw_header(),
-        &json!({
-            "execution_state": "busy",
-        }),
-    )
-    .map_err(|err| wire::ErrorReply {
-        exception_value: err.to_string().into(),
-        ..wire::ErrorReply::new("IOError")
-    })?;
-
-    let execution_count = *execution_counter + 1;
-    span.record("execution_count", execution_count);
-    if !req_content.silent && req_content.store_history {
-        *execution_counter += 1;
-    }
-    reply(
-        session_id,
-        auth,
-        io_pub_socket,
-        "execute_input",
-        iter::empty::<Vec<u8>>(),
-        message.raw_header(),
-        &json!({
-            "code": &req_content.code,
-            "execution_count": execution_count,
-        }),
-    )
-    .map_err(|err| wire::ErrorReply {
-        exception_value: err.to_string().into(),
-        execution_count: Some(execution_count),
-        ..wire::ErrorReply::new("IOError")
-    })?;
-
-    match run_code(conn, &req_content.code) {
-        Ok((plain, html)) => {
-            let data = if plain.is_empty() && html.is_empty() {
-                let _ = reply(
-                    session_id,
-                    auth,
-                    io_pub_socket,
-                    "clear_output",
-                    iter::empty::<Vec<u8>>(),
-                    message.raw_header(),
-                    &json!({
-                        "wait": false,
-                    }),
-                );
-                json!({})
-            } else {
-                json!({"text/plain": plain, "text/html": html})
-            };
-            reply(
-                session_id,
-                auth,
-                io_pub_socket,
-                "execute_result",
-                iter::empty::<Vec<u8>>(),
-                message.raw_header(),
-                &json!({
-                    "execution_count": execution_count,
-                    "data": data,
-                    "metadata": {},
-                }),
-            )
-            .map_err(|err| wire::ErrorReply {
-                exception_value: err.to_string().into(),
-                execution_count: Some(execution_count),
-                ..wire::ErrorReply::new("IOError")
-            })?;
-
-            Ok(wire::ExecuteReply {
-                execution_count,
-                user_expressions: HashMap::new(),
-            })
-        }
-        Err((base_offset, err)) => {
-            let err_string = err.to_string();
-            let traceback = if let Some(off) = err.error_offset() {
-                let (lineno, col) = str_position(&req_content.code, base_offset + off);
-                format!("{}:{}: {}", lineno, col, &err_string)
-            } else {
-                err_string.clone()
-            };
-            let err_reply = wire::ErrorReply {
-                execution_count: Some(execution_count),
-                traceback: vec![traceback.into()],
-                exception_value: err_string.into(),
-                ..wire::ErrorReply::new(format!("{:?}", err.result_code()))
-            };
-            let _ = reply(
-                session_id,
-                auth,
-                io_pub_socket,
-                "error",
-                iter::empty::<Vec<u8>>(),
-                message.raw_header(),
-                &json!({
-                    "ename": err_reply.exception_name.clone(),
-                    "evalue": err_reply.exception_value.clone(),
-                    "traceback": err_reply.traceback.clone(),
-                }),
-            );
-
-            Err(err_reply)
-        }
-    }
-}
-
-fn run_code(
-    conn: &mut Connection,
-    mut code: &str,
-) -> Result<(String, String), (usize, zombiezen_sqlite::Error)> {
-    let mut plain_result = String::new();
-    let mut html_result = String::new();
-    let orig_size = code.len();
-    let map_err = |err| (orig_size - code.len(), err);
-    let mut first_select = true;
-    while !code.is_empty() {
-        let (mut stmt, tail) = match conn.prepare(code).map_err(map_err)? {
-            Some(x) => x,
-            None => break,
-        };
-
-        let column_count = stmt.column_count();
-        if column_count > 0 {
-            html_result.push_str("<table>\n<thead><tr>");
-            for i in 0..column_count {
-                let name = stmt.column_name(i).unwrap();
-                html_result.push_str("<th scope=\"col\">");
-                escape_html(&mut html_result, &name);
-                html_result.push_str("</th>");
-            }
-            html_result.push_str("</tr></thead>\n<tbody>\n");
-
-            if !first_select {
-                plain_result.push_str("\n");
-            }
-        }
-        loop {
-            match stmt.step().map_err(map_err)? {
-                StepResult::Done => break,
-                StepResult::Row => {
-                    html_result.push_str("<tr>");
-                    for i in 0..column_count {
-                        let val = String::from_utf8_lossy(
-                            stmt.column_blob(i).expect("column should be in range"),
-                        );
-
-                        html_result.push_str("<td>");
-                        escape_html(&mut html_result, &val);
-                        html_result.push_str("</td>");
-
-                        if i > 0 {
-                            plain_result.push_str("|");
-                        }
-                        plain_result.push_str(&val);
-                    }
-                    html_result.push_str("</tr>\n");
-                    plain_result.push_str("\n");
-                }
-            }
-        }
-        if column_count > 0 {
-            html_result.push_str("</tbody></table>\n");
-            first_select = false;
-        }
-        code = tail;
-    }
-    Ok((plain_result, html_result))
-}
-
 fn is_complete(
     request: &wire::IsCompleteRequest,
 ) -> Result<wire::IsCompleteReply, wire::ErrorReply<'static>> {
@@ -591,7 +382,7 @@ fn is_complete(
     } else {
         Ok(wire::IsCompleteReply {
             status: wire::IsCompleteStatus::Incomplete,
-            indent: Some("  ".to_string()),
+            indent: Some(String::new()),
         })
     }
 }
@@ -624,7 +415,7 @@ fn handle_heartbeat(socket: &mut Socket) -> Result<()> {
     let mut buf = [0u8; 4096];
     let result = socket.recv(&mut buf, RecvFlags::default())?;
     if result.is_truncated() {
-        eprintln!("Heartbeat truncated");
+        warn!("Heartbeat truncated");
         return Ok(());
     }
     socket.send(
@@ -664,36 +455,4 @@ where
 fn drain_socket(socket: &mut Socket) {
     let mut buf = [0u8; 4096];
     let _ = socket.recv(&mut buf, RecvFlags::default());
-}
-
-fn str_position(s: &str, off: usize) -> (usize, usize) {
-    let mut lineno = 1;
-    let mut col = 1;
-    for c in s[..off].chars() {
-        // TODO(soon): Tabs.
-        match c {
-            '\n' => {
-                lineno += 1;
-                col = 1;
-            }
-            _ => {
-                col += 1;
-            }
-        }
-    }
-    (lineno, col)
-}
-
-fn escape_html(dst: &mut String, s: &str) {
-    dst.reserve(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => dst.push_str("&amp;"),
-            '<' => dst.push_str("&lt;"),
-            '>' => dst.push_str("&gt;"),
-            '\'' => dst.push_str("&#39;"),
-            '"' => dst.push_str("&#34;"),
-            _ => dst.push(c),
-        }
-    }
 }
