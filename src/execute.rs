@@ -192,13 +192,10 @@ fn run_code(
         let (lineno, col) = str_position(orig_code, offset);
         (lineno, col, err)
     };
-    let mut first_select = true;
     while !code.is_empty() {
         // Check for special directives.
-        let (line, tail) = match code.find('\n') {
-            Some(eol) => (&code[..eol], &code[eol + 1..]),
-            None => (code, ""),
-        };
+        let (line, tail) = cut(code, "\n");
+        let tail = tail.unwrap_or("");
         match code.bytes().next() {
             Some(b'.') => {
                 let (lineno, _) = str_position(orig_code, orig_code.len() - code.len());
@@ -236,10 +233,6 @@ fn run_code(
                 );
             }
             result.html.push_str("</tr></thead>\n<tbody>\n");
-
-            if !first_select {
-                result.plain.push_str("\n");
-            }
         }
         loop {
             match stmt.step().map_err(map_err)? {
@@ -298,7 +291,6 @@ fn run_code(
         }
         if column_count > 0 {
             result.html.push_str("</tbody></table>\n");
-            first_select = false;
         }
         code = tail;
     }
@@ -412,8 +404,12 @@ impl SQLiteOutputBuilder {
             .expect("writing to String should never fail");
         let csv = String::from_utf8(csv_bytes)
             .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
+        let mut plain = self.plain;
+        if plain.ends_with('\n') {
+            plain.truncate(plain.len() - 1);
+        }
         SQLiteOutput {
-            plain: self.plain,
+            plain,
             html: self.html,
             csv,
             stdout: self.stdout,
@@ -471,16 +467,11 @@ impl<'a> DotCommandLine<'a> {
                 None => return Ok(DotCommandLine { name, args }),
                 Some(b'\'') => {
                     line = &line[1..];
-                    match line.find('\'') {
-                        None => {
-                            args.push(line.into());
-                            return Ok(DotCommandLine { name, args });
-                        }
-                        Some(arg_end) => {
-                            let (arg, tail) = line.split_at(arg_end);
-                            args.push(arg.into());
-                            line = &tail[1..];
-                        }
+                    let (arg, tail) = cut(line, "'");
+                    args.push(arg.into());
+                    match tail {
+                        None => return Ok(DotCommandLine { name, args }),
+                        Some(tail) => line = tail,
                     }
                 }
                 // TODO(soon): Double-quotes.
@@ -516,6 +507,13 @@ fn str_position(s: &str, off: usize) -> (usize, usize) {
         }
     }
     (lineno, col)
+}
+
+fn cut<'a, 'b>(s: &'a str, sep: &'b str) -> (&'a str, Option<&'a str>) {
+    match s.find(sep) {
+        Some(i) => (&s[..i], Some(&s[i + sep.len()..])),
+        None => (s, None),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

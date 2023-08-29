@@ -200,6 +200,7 @@ impl<'c> Statement<'c> {
         }
     }
 
+    #[inline(always)]
     fn check_col(&self, i: usize) {
         assert!(self.has_row);
         let n = self.column_count();
