@@ -63,16 +63,25 @@ impl ResultCode {
         }
     }
 
-    pub fn to_error(self) -> Option<Error> {
+    /// Converts a result code to a [`Result`].
+    /// Successful codes will be a `Ok` of the code itself
+    /// and unsuccessful codes will be converted into an [`Error`].
+    pub fn to_result(self) -> Result<ResultCode> {
         if self.is_success() {
-            None
+            Ok(self)
         } else {
-            Some(Error {
+            Err(Error {
                 result_code: self,
                 msg: String::new(),
                 error_offset: None,
             })
         }
+    }
+}
+
+impl From<ResultCode> for Result<ResultCode> {
+    fn from(rc: ResultCode) -> Self {
+        rc.to_result()
     }
 }
 

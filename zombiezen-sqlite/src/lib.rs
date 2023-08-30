@@ -1,25 +1,28 @@
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
+use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr::{self, null, NonNull};
 use std::str::{self, Utf8Error};
 use std::{fmt, slice};
 
+mod bytearray;
 mod result;
 
 pub use result::*;
 
 use bitflags::bitflags;
 use libsqlite3_sys::{
-    sqlite3, sqlite3_clear_bindings, sqlite3_close, sqlite3_column_blob, sqlite3_column_bytes,
-    sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64, sqlite3_column_name,
-    sqlite3_column_text, sqlite3_column_type, sqlite3_complete, sqlite3_db_config,
-    sqlite3_db_handle, sqlite3_finalize, sqlite3_libversion, sqlite3_open_v2, sqlite3_prepare_v2,
-    sqlite3_reset, sqlite3_step, sqlite3_stmt, sqlite3_strlike, SQLITE_BLOB,
+    sqlite3, sqlite3_bind_blob64, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
+    sqlite3_bind_parameter_count, sqlite3_bind_parameter_name, sqlite3_bind_text64,
+    sqlite3_bind_zeroblob64, sqlite3_clear_bindings, sqlite3_close, sqlite3_column_blob,
+    sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64,
+    sqlite3_column_name, sqlite3_column_text, sqlite3_column_type, sqlite3_complete,
+    sqlite3_db_config, sqlite3_db_handle, sqlite3_finalize, sqlite3_libversion, sqlite3_open_v2,
+    sqlite3_prepare_v2, sqlite3_reset, sqlite3_step, sqlite3_stmt, sqlite3_strlike, SQLITE_BLOB,
     SQLITE_DBCONFIG_DQS_DDL, SQLITE_DBCONFIG_DQS_DML, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER,
     SQLITE_NOMEM, SQLITE_NULL, SQLITE_OPEN_CREATE, SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY,
     SQLITE_OPEN_NOMUTEX, SQLITE_OPEN_READONLY, SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE,
-    SQLITE_OPEN_URI, SQLITE_ROW, SQLITE_TEXT,
+    SQLITE_OPEN_URI, SQLITE_ROW, SQLITE_TEXT, SQLITE_UTF8,
 };
 
 #[repr(transparent)]
@@ -39,7 +42,7 @@ impl Connection {
         });
         let db = match NonNull::new(unsafe { db.assume_init() }) {
             Some(db) => db,
-            None => return Err(ResultCode::NOMEM.to_error().unwrap()),
+            None => return Err(ResultCode::NOMEM.to_result().unwrap_err()),
         };
         if rc != ResultCode::OK {
             let err = Error::get(db).expect("Result was successful, but not SQLITE_OK");
@@ -74,7 +77,7 @@ impl Connection {
         let n_byte: c_int = sql
             .len()
             .try_into()
-            .map_err(|_| ResultCode::TOOBIG.to_error().unwrap())?;
+            .map_err(|_| ResultCode::TOOBIG.to_result().unwrap_err())?;
         let mut stmt = MaybeUninit::uninit();
         let z_sql = sql.as_ptr() as *const c_char;
         let mut tail = MaybeUninit::uninit();
@@ -165,10 +168,127 @@ impl<'c> Statement<'c> {
         }
     }
 
+    /// Reset all host parameters to `NULL`.
     pub fn clear_bindings(&mut self) {
         unsafe {
             sqlite3_clear_bindings(self.ptr.as_ptr());
         }
+    }
+
+    /// Returns the index of the largest (rightmost) parameter.
+    /// For all forms except `?NNN`,
+    /// this will correspond to the number of unique parameters.
+    pub fn bind_parameter_count(&self) -> usize {
+        (unsafe { sqlite3_bind_parameter_count(self.ptr.as_ptr()) }) as usize
+    }
+
+    #[inline(always)]
+    fn usize_to_int(i: usize) -> Result<c_int, Error> {
+        c_int::try_from(i).map_err(|_| ResultCode::RANGE.to_result().unwrap_err())
+    }
+
+    /// Returns the name of the `i`th [SQL parameter] in the statement.
+    /// The first host parameter has an index of 1.
+    /// The initial `":"` or `"$"` or `"@"` or `"?"` is included as part of the name.
+    ///
+    /// [SQL parameter]: https://www.sqlite.org/c3ref/bind_blob.html
+    pub fn bind_parameter_name(&self, i: usize) -> Option<&CStr> {
+        let i = Self::usize_to_int(i).ok()?;
+        unsafe {
+            let ptr = sqlite3_bind_parameter_name(self.ptr.as_ptr(), i);
+            if ptr.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(ptr))
+            }
+        }
+    }
+
+    /// Returns the index of a [SQL parameter] given its `name`.
+    /// The index value returned is suitable
+    /// for use as the index parameter to the `bind_*` functions.
+    ///
+    /// [SQL parameter]: https://www.sqlite.org/c3ref/bind_blob.html
+    pub fn bind_parameter_index(&self, name: &str) -> Option<usize> {
+        // Calling sqlite3_bind_parameter_index would require allocating a C string.
+        // Since SQLite will always store these as UTF-8
+        // and we can guarantee the input is valid UTF-8 (more convenient anyway),
+        // we just do the iteration ourselves.
+        (1..=self.bind_parameter_count()).find_map(|i| {
+            self.bind_parameter_name(i).and_then(|name_i| {
+                if name.as_bytes() == name_i.to_bytes() {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    #[inline(always)]
+    fn bind<F>(&mut self, i: usize, f: F) -> Result<()>
+    where
+        F: FnOnce(*mut sqlite3_stmt, c_int) -> c_int,
+    {
+        let i = Self::usize_to_int(i)?;
+        let rc = ResultCode(f(self.ptr.as_ptr(), i));
+        if rc.is_success() {
+            Ok(())
+        } else {
+            Err(self.error().expect("sqlite3_bind_* returned an error but "))
+        }
+    }
+
+    /// Sets a host parameter in a statement to `NULL`.
+    /// The first host parameter has an index of 1.
+    pub fn bind_null(&mut self, i: usize) -> Result<()> {
+        self.bind(i, |stmt, i| unsafe { sqlite3_bind_null(stmt, i) })
+    }
+
+    /// Sets a host parameter in a statement to a 64-bit integer.
+    /// The first host parameter has an index of 1.
+    pub fn bind_i64(&mut self, i: usize, v: i64) -> Result<()> {
+        self.bind(i, |stmt, i| unsafe { sqlite3_bind_int64(stmt, i, v) })
+    }
+
+    /// Sets a host parameter in a statement to a 64-bit floating point number.
+    /// The first host parameter has an index of 1.
+    pub fn bind_f64(&mut self, i: usize, v: f64) -> Result<()> {
+        self.bind(i, |stmt, i| unsafe { sqlite3_bind_double(stmt, i, v) })
+    }
+
+    /// Sets a host parameter in a statement to a UTF-8 string.
+    /// The first host parameter has an index of 1.
+    pub fn bind_text(&mut self, i: usize, v: impl Into<String>) -> Result<()> {
+        self.bind(i, |stmt, i| {
+            let (ptr, n) = bytearray::new(v.into().into_bytes());
+            unsafe {
+                sqlite3_bind_text64(
+                    stmt,
+                    i,
+                    ptr.cast::<c_char>().as_ptr(),
+                    n as u64,
+                    Some(bytearray::destroy),
+                    SQLITE_UTF8 as c_uchar,
+                )
+            }
+        })
+    }
+
+    /// Sets a host parameter in a statement to a `BLOB` (byte slice).
+    /// The first host parameter has an index of 1.
+    pub fn bind_blob(&mut self, i: usize, v: impl Into<Vec<u8>>) -> Result<()> {
+        self.bind(i, |stmt, i| unsafe {
+            let (ptr, n) = bytearray::new(v.into());
+            sqlite3_bind_blob64(stmt, i, ptr.as_ptr(), n as u64, Some(bytearray::destroy))
+        })
+    }
+
+    /// Sets a host parameter in a statement to a zero-filled `BLOB` with length `n`.
+    /// A zeroblob uses a fixed amount of memory while it is being processed.
+    /// The first host parameter has an index of 1.
+    pub fn bind_zeroblob(&mut self, i: usize, n: u64) -> Result<()> {
+        self.bind(i, |stmt, i| unsafe { sqlite3_bind_zeroblob64(stmt, i, n) })
     }
 
     /// Returns the number of columns in the result set returned by the statement.
@@ -527,6 +647,23 @@ mod tests {
         assert_eq!(stmt.column_i64(0), 123);
         assert_eq!(stmt.column_type(1), ColumnType::Text);
         assert_eq!(stmt.column_text(1).unwrap(), "foo");
+
+        assert_eq!(stmt.step().unwrap(), StepResult::Done);
+    }
+
+    #[test]
+    fn test_bind_text() {
+        let conn = Connection::open(MEMORY, OpenFlags::default()).unwrap();
+        let (mut stmt, _) = conn
+            .prepare("select ?1;")
+            .unwrap()
+            .expect("statement is not empty");
+        const WANT: &str = "Hello, World!\n";
+        stmt.bind_text(1, WANT).unwrap();
+
+        assert_eq!(stmt.step().unwrap(), StepResult::Row);
+        assert_eq!(stmt.column_type(0), ColumnType::Text);
+        assert_eq!(stmt.column_text(0).unwrap(), WANT);
 
         assert_eq!(stmt.step().unwrap(), StepResult::Done);
     }
