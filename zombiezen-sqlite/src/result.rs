@@ -63,6 +63,12 @@ impl ResultCode {
         }
     }
 
+    /// Returns the English-language text that describes the result code.
+    pub fn message(self) -> &'static str {
+        let s = unsafe { CStr::from_ptr(sqlite3_errstr(self.0)) };
+        s.to_str().unwrap_or("unknown error")
+    }
+
     /// Converts a result code to a [`Result`].
     /// Successful codes will be a `Ok` of the code itself
     /// and unsuccessful codes will be converted into an [`Error`].
@@ -99,8 +105,7 @@ impl Default for ResultCode {
 
 impl fmt::Display for ResultCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = unsafe { CStr::from_ptr(sqlite3_errstr(self.0)) };
-        f.write_str(s.to_string_lossy().as_ref())
+        f.write_str(self.message())
     }
 }
 
@@ -115,6 +120,20 @@ pub struct Error {
 }
 
 impl Error {
+    /// Returns a new `Error` with the given error code and message.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `result_code` represents success.
+    pub fn new(result_code: ResultCode, msg: impl Into<String>) -> Error {
+        assert!(!result_code.is_success());
+        Error {
+            result_code,
+            msg: msg.into(),
+            error_offset: None,
+        }
+    }
+
     /// Extracts error information from the connection.
     pub(crate) fn get(db: NonNull<sqlite3>) -> Option<Self> {
         let result_code = ResultCode(unsafe { sqlite3_extended_errcode(db.as_ptr()) });
@@ -144,6 +163,14 @@ impl Error {
     #[inline]
     pub fn error_offset(&self) -> Option<usize> {
         self.error_offset
+    }
+
+    pub fn message(&self) -> &str {
+        if self.msg.is_empty() {
+            self.result_code.message()
+        } else {
+            &self.msg
+        }
     }
 }
 

@@ -1,13 +1,20 @@
+use std::borrow::Borrow;
+use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr};
+use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+use std::ops::Deref;
 use std::ptr::{self, null, NonNull};
+use std::rc::Rc;
 use std::str::{self, Utf8Error};
 use std::{fmt, slice};
 
 mod bytearray;
+mod function;
 mod result;
 
+pub use function::*;
 pub use result::*;
 
 use bitflags::bitflags;
@@ -16,61 +23,38 @@ use libsqlite3_sys::{
     sqlite3_bind_parameter_count, sqlite3_bind_parameter_name, sqlite3_bind_text64,
     sqlite3_bind_zeroblob64, sqlite3_clear_bindings, sqlite3_close, sqlite3_column_blob,
     sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64,
-    sqlite3_column_name, sqlite3_column_text, sqlite3_column_type, sqlite3_complete,
-    sqlite3_db_config, sqlite3_db_handle, sqlite3_finalize, sqlite3_libversion, sqlite3_open_v2,
-    sqlite3_prepare_v2, sqlite3_reset, sqlite3_step, sqlite3_stmt, sqlite3_strlike, SQLITE_BLOB,
-    SQLITE_DBCONFIG_DQS_DDL, SQLITE_DBCONFIG_DQS_DML, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER,
-    SQLITE_NOMEM, SQLITE_NULL, SQLITE_OPEN_CREATE, SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY,
-    SQLITE_OPEN_NOMUTEX, SQLITE_OPEN_READONLY, SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE,
-    SQLITE_OPEN_URI, SQLITE_ROW, SQLITE_TEXT, SQLITE_UTF8,
+    sqlite3_column_name, sqlite3_column_text, sqlite3_column_type, sqlite3_column_value,
+    sqlite3_complete, sqlite3_db_config, sqlite3_db_handle, sqlite3_finalize, sqlite3_libversion,
+    sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_reset, sqlite3_step, sqlite3_stmt,
+    sqlite3_strlike, SQLITE_BLOB, SQLITE_DBCONFIG_DQS_DDL, SQLITE_DBCONFIG_DQS_DML, SQLITE_DONE,
+    SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NOMEM, SQLITE_NULL, SQLITE_OPEN_CREATE,
+    SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY, SQLITE_OPEN_NOMUTEX, SQLITE_OPEN_READONLY,
+    SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE, SQLITE_OPEN_URI, SQLITE_ROW, SQLITE_TEXT,
+    SQLITE_UTF8,
 };
 
-#[repr(transparent)]
-#[derive(Debug)]
-pub struct Connection(NonNull<sqlite3>);
+type PhantomUnsend = PhantomData<Rc<()>>;
+type PhantomUnsync = PhantomData<Cell<()>>;
 
-impl Connection {
-    pub fn open(filename: impl AsRef<CStr>, flags: OpenFlags) -> Result<Connection> {
-        let mut db = MaybeUninit::uninit();
-        let rc = ResultCode(unsafe {
-            sqlite3_open_v2(
-                filename.as_ref().as_ptr(),
-                db.as_mut_ptr(),
-                flags.bits() as c_int,
-                null(),
-            )
-        });
-        let db = match NonNull::new(unsafe { db.assume_init() }) {
-            Some(db) => db,
-            None => return Err(ResultCode::NOMEM.to_result().unwrap_err()),
-        };
-        if rc != ResultCode::OK {
-            let err = Error::get(db).expect("Result was successful, but not SQLITE_OK");
-            unsafe {
-                sqlite3_close(db.as_ptr());
-            }
-            return Err(err);
-        }
-        let conn = Connection(db);
-        unsafe {
-            sqlite3_db_config(
-                db.as_ptr(),
-                SQLITE_DBCONFIG_DQS_DML,
-                0 as c_int,
-                ptr::null::<c_void>(),
-            );
-            sqlite3_db_config(
-                db.as_ptr(),
-                SQLITE_DBCONFIG_DQS_DDL,
-                0 as c_int,
-                ptr::null::<c_void>(),
-            );
-        }
-        Ok(conn)
+#[repr(transparent)]
+pub struct Conn {
+    db: sqlite3,
+    unsync: PhantomUnsync,
+}
+
+impl Conn {
+    fn error(&self) -> Option<Error> {
+        Error::get(self.as_nonnull())
     }
 
-    fn error(&self) -> Option<Error> {
-        Error::get(self.0)
+    #[inline]
+    fn as_nonnull(&self) -> NonNull<sqlite3> {
+        unsafe { NonNull::new_unchecked(self.as_ptr()) }
+    }
+
+    #[inline]
+    fn as_ptr(&self) -> *mut sqlite3 {
+        ptr::addr_of!(self.db) as *mut sqlite3
     }
 
     pub fn prepare<'c, 's>(&'c self, sql: &'s str) -> Result<Option<(Statement<'c>, &'s str)>> {
@@ -83,7 +67,7 @@ impl Connection {
         let mut tail = MaybeUninit::uninit();
         let rc = ResultCode(unsafe {
             sqlite3_prepare_v2(
-                self.0.as_ptr(),
+                self.as_ptr(),
                 z_sql,
                 n_byte,
                 stmt.as_mut_ptr(),
@@ -107,10 +91,74 @@ impl Connection {
     }
 }
 
+impl Debug for Conn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Pointer::fmt(&&self.db, f)
+    }
+}
+
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct Connection(NonNull<Conn>);
+
+impl Connection {
+    pub fn open(filename: impl AsRef<CStr>, flags: OpenFlags) -> Result<Connection> {
+        let mut db = MaybeUninit::uninit();
+        let rc = ResultCode(unsafe {
+            sqlite3_open_v2(
+                filename.as_ref().as_ptr(),
+                db.as_mut_ptr(),
+                flags.bits() as c_int,
+                null(),
+            )
+        });
+        let db = match NonNull::new(unsafe { db.assume_init() }) {
+            Some(db) => db.cast::<Conn>(),
+            None => return Err(ResultCode::NOMEM.to_result().unwrap_err()),
+        };
+        let conn = Connection(db); // Now will drop properly.
+        if rc != ResultCode::OK {
+            return Err(conn.error().unwrap());
+        }
+        unsafe {
+            sqlite3_db_config(
+                db.as_ptr() as *mut sqlite3,
+                SQLITE_DBCONFIG_DQS_DML,
+                0 as c_int,
+                ptr::null::<c_void>(),
+            );
+            sqlite3_db_config(
+                db.as_ptr() as *mut sqlite3,
+                SQLITE_DBCONFIG_DQS_DDL,
+                0 as c_int,
+                ptr::null::<c_void>(),
+            );
+        }
+        Ok(conn)
+    }
+}
+
+impl Deref for Connection {
+    type Target = Conn;
+
+    fn deref(&self) -> &Self::Target {
+        self.borrow()
+    }
+}
+
+impl Borrow<Conn> for Connection {
+    fn borrow(&self) -> &Conn {
+        unsafe { self.0.as_ref() }
+    }
+}
+
 impl Drop for Connection {
     fn drop(&mut self) {
         unsafe {
-            assert_eq!(ResultCode(sqlite3_close(self.0.as_ptr())), ResultCode::OK);
+            assert_eq!(
+                ResultCode(sqlite3_close(self.0.as_ptr() as *mut sqlite3)),
+                ResultCode::OK
+            );
         }
     }
 }
@@ -448,6 +496,23 @@ impl<'c> Statement<'c> {
         }
     }
 
+    /// Returns the unprotected value of the `i`th column.
+    /// This is normally only useful in the application-defined SQL functions.
+    /// The leftmost column is number 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the statement has not returned a row
+    /// or if `i >= self.column_count()`.
+    pub fn column_value(&self, i: usize) -> &Value<Unprotected> {
+        self.check_col(i);
+        unsafe {
+            let ptr = sqlite3_column_value(self.ptr.as_ptr(), i as c_int);
+            debug_assert!(!ptr.is_null());
+            &*(ptr as *mut Value<Unprotected>)
+        }
+    }
+
     /// Releases any resources associated with the statement
     /// and returns any error from the most recent evaluation of the statement.
     /// Even if there were no previous errors, `finalize` may still return an error
@@ -498,7 +563,7 @@ impl<'a> ColumnTextError<'a> {
 
 impl<'a> fmt::Display for ColumnTextError<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.err.fmt(f)
+        fmt::Display::fmt(&self.err, f)
     }
 }
 
@@ -634,19 +699,25 @@ mod tests {
     fn test_read_values() {
         let conn = Connection::open(MEMORY, OpenFlags::default()).unwrap();
         let (mut stmt, _) = conn
-            .prepare("select 123 as \"int\", 'foo' as \"text\";")
+            .prepare("select 123 as \"int\", 'foo' as \"text\", null as \"null\";")
             .unwrap()
             .expect("statement is not empty");
-        assert_eq!(stmt.column_count(), 2);
+        assert_eq!(stmt.column_count(), 3);
         assert_eq!(stmt.column_name(0), Some(String::from("int")));
         assert_eq!(stmt.column_name(1), Some(String::from("text")));
-        assert_eq!(stmt.column_name(2), None);
+        assert_eq!(stmt.column_name(2), Some(String::from("null")));
+        assert_eq!(stmt.column_name(3), None);
 
         assert_eq!(stmt.step().unwrap(), StepResult::Row);
         assert_eq!(stmt.column_type(0), ColumnType::Integer);
         assert_eq!(stmt.column_i64(0), 123);
         assert_eq!(stmt.column_type(1), ColumnType::Text);
         assert_eq!(stmt.column_text(1).unwrap(), "foo");
+        assert_eq!(stmt.column_type(2), ColumnType::Null);
+        assert_eq!(
+            stmt.column_value(2).dup().as_mut().r#type(),
+            ColumnType::Null
+        );
 
         assert_eq!(stmt.step().unwrap(), StepResult::Done);
     }
