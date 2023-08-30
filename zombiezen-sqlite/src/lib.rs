@@ -1,4 +1,4 @@
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr::{self, null, NonNull};
@@ -15,11 +15,11 @@ use libsqlite3_sys::{
     sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64, sqlite3_column_name,
     sqlite3_column_text, sqlite3_column_type, sqlite3_complete, sqlite3_db_config,
     sqlite3_db_handle, sqlite3_finalize, sqlite3_libversion, sqlite3_open_v2, sqlite3_prepare_v2,
-    sqlite3_reset, sqlite3_step, sqlite3_stmt, SQLITE_BLOB, SQLITE_DBCONFIG_DQS_DDL,
-    SQLITE_DBCONFIG_DQS_DML, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NOMEM, SQLITE_NULL,
-    SQLITE_OPEN_CREATE, SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY, SQLITE_OPEN_NOMUTEX,
-    SQLITE_OPEN_READONLY, SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE, SQLITE_OPEN_URI,
-    SQLITE_ROW, SQLITE_TEXT,
+    sqlite3_reset, sqlite3_step, sqlite3_stmt, sqlite3_strlike, SQLITE_BLOB,
+    SQLITE_DBCONFIG_DQS_DDL, SQLITE_DBCONFIG_DQS_DML, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER,
+    SQLITE_NOMEM, SQLITE_NULL, SQLITE_OPEN_CREATE, SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY,
+    SQLITE_OPEN_NOMUTEX, SQLITE_OPEN_READONLY, SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE,
+    SQLITE_OPEN_URI, SQLITE_ROW, SQLITE_TEXT,
 };
 
 #[repr(transparent)]
@@ -470,6 +470,26 @@ pub fn is_complete(s: impl AsRef<CStr>) -> bool {
     }
 }
 
+/// Reports whether `s` matches the [`LIKE`] pattern `glob`
+/// with the given escape character.
+/// For `s LIKE glob` without the `ESCAPE` clause,
+/// use 0 for `escape_char`.
+/// As with the `LIKE` operator, the `strlike` function is case insensitive -
+/// equivalent upper and lower case ASCII characters match one another.
+/// The `strlike` function matches Unicode characters,
+/// though only ASCII characters are case folded.
+///
+/// [`LIKE`]: https://www.sqlite.org/lang_expr.html#like
+pub fn strlike(glob: impl AsRef<CStr>, s: impl AsRef<CStr>, escape_char: char) -> bool {
+    (unsafe {
+        sqlite3_strlike(
+            glob.as_ref().as_ptr(),
+            s.as_ref().as_ptr(),
+            escape_char as c_uint,
+        )
+    }) == 0
+}
+
 pub fn version() -> &'static str {
     let s = unsafe { CStr::from_ptr(sqlite3_libversion()) };
     std::str::from_utf8(s.to_bytes()).unwrap()
@@ -477,22 +497,22 @@ pub fn version() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
+    use zombiezen_const_cstr::{const_cstr, ConstCStr};
 
     use super::*;
 
+    const MEMORY: ConstCStr = const_cstr!(":memory:");
+
     #[test]
     fn test_prepare_empty() {
-        let conn =
-            Connection::open(&CString::new(":memory:").unwrap(), OpenFlags::default()).unwrap();
+        let conn = Connection::open(MEMORY, OpenFlags::default()).unwrap();
         let result = conn.prepare("").unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_read_values() {
-        let conn =
-            Connection::open(&CString::new(":memory:").unwrap(), OpenFlags::default()).unwrap();
+        let conn = Connection::open(MEMORY, OpenFlags::default()).unwrap();
         let (mut stmt, _) = conn
             .prepare("select 123 as \"int\", 'foo' as \"text\";")
             .unwrap()
@@ -509,5 +529,19 @@ mod tests {
         assert_eq!(stmt.column_text(1).unwrap(), "foo");
 
         assert_eq!(stmt.step().unwrap(), StepResult::Done);
+    }
+
+    #[test]
+    fn test_strlike() {
+        assert!(strlike(const_cstr!("foo"), const_cstr!("foo"), '\x00'));
+        assert!(strlike(const_cstr!("%oob%"), const_cstr!("foobar"), '\x00'));
+        assert!(strlike(const_cstr!("a\\%b"), const_cstr!("a\\b"), '\x00'));
+        assert!(!strlike(const_cstr!("a\\%b"), const_cstr!("a\\b"), '\\'));
+        assert!(strlike(const_cstr!("a\\%b"), const_cstr!("a%b"), '\\'));
+        assert!(!strlike(
+            const_cstr!("%bork%"),
+            const_cstr!("foobar"),
+            '\x00'
+        ));
     }
 }
