@@ -214,7 +214,8 @@ where
         match self.iter.peek() {
             Some(x) => match (self.filter_map)(x) {
                 Some(y) => {
-                    debug_assert!(self.iter.next().is_some());
+                    let x = self.iter.next();
+                    debug_assert!(x.is_some());
                     self.take -= 1;
                     Some(y)
                 }
