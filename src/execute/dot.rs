@@ -2,12 +2,16 @@ use std::fmt::Write;
 use std::iter::{FusedIterator, Peekable};
 
 use anyhow::Result;
-use zombiezen_sqlite::{Connection, StepResult};
+use tracing::debug;
+use zombiezen_const_cstr::const_cstr;
+use zombiezen_sqlite::{Conn, StepResult};
+
+use crate::c::cstring_until_first_nul;
 
 use super::*;
 
 pub(super) fn process_dot_command(
-    conn: &mut Connection,
+    conn: &Conn,
     line: &str,
     lineno: usize,
     result: &mut SQLiteOutputBuilder,
@@ -25,7 +29,81 @@ pub(super) fn process_dot_command(
             let _ = writeln!(&mut result.stdout, "This is help.");
         }
         "s" | "schema" => {
-            let (mut stmt, _) = conn.prepare("SELECT sql FROM sqlite_master;")?.unwrap();
+            if line.args.len() >= 2 {
+                let _ = writeln!(
+                    &mut result.stderr,
+                    "line {lineno}: usage: .schema ?LIKE-PATTERN?"
+                );
+                return Ok(());
+            }
+
+            if let Some(pattern) = line.args.get(0) {
+                let cpattern = cstring_until_first_nul(pattern.as_ref().to_owned());
+                let is_schema =
+                    zombiezen_sqlite::strlike(&cpattern, const_cstr!("sqlite_master"), '\\')
+                        || zombiezen_sqlite::strlike(&cpattern, const_cstr!("sqlite_schema"), '\\')
+                        || zombiezen_sqlite::strlike(
+                            &cpattern,
+                            const_cstr!("sqlite_temp_master"),
+                            '\\',
+                        )
+                        || zombiezen_sqlite::strlike(
+                            &cpattern,
+                            const_cstr!("sqlite_temp_schema"),
+                            '\\',
+                        );
+                if is_schema {
+                    // TODO(soon): Use the name that actually matched.
+                    // Don't worry, the _actual CLI_ has the same bug.
+                    display_schema(result, &format!(include_str!("sqlite_schema.sql"), pattern));
+                }
+            }
+
+            let schema_query = {
+                let (mut database_list_stmt, _) = conn
+                    .prepare("SELECT name FROM pragma_database_list")?
+                    .unwrap();
+                let mut div = "(";
+                let mut schema_query = String::from("SELECT sql FROM");
+                let mut schema_num = 1usize;
+                while database_list_stmt.step()? == StepResult::Row {
+                    let db = database_list_stmt
+                        .column_text(0)
+                        .map_or_else(|err| String::from_utf8_lossy(err.as_bytes()), |s| s.into());
+                    schema_query.push_str(div);
+                    div = " UNION ALL ";
+                    schema_query.push_str("SELECT shell_add_schema(sql,");
+                    // TODO(soon): Really need to quote/escape this all better.
+                    if db != "main" {
+                        write!(&mut schema_query, "'{}'", db).unwrap();
+                    } else {
+                        schema_query.push_str("NULL");
+                    }
+                    schema_query.push_str(",name) AS sql, type, tbl_name, name, rowid,");
+                    write!(&mut schema_query, "{schema_num} AS snum, ").unwrap();
+                    schema_num += 1;
+                    write!(&mut schema_query, "'{db}' AS sname ").unwrap();
+                    write!(&mut schema_query, "FROM {db}.sqlite_schema").unwrap();
+                }
+
+                schema_query.push_str(") WHERE ");
+                if let Some(pattern) = line.args.get(0) {
+                    if pattern.contains('.') {
+                        schema_query.push_str("lower(printf('%s.%s',sname,tbl_name))")
+                    } else {
+                        schema_query.push_str("lower(tbl_name)")
+                    }
+                    // TODO(someday): Better quoting.
+                    let is_glob = pattern.contains(&['*', '?', '[']);
+                    schema_query.push_str(if is_glob { " GLOB " } else { " LIKE " });
+                    write!(&mut schema_query, "'{pattern}' AND ").unwrap();
+                }
+                schema_query.push_str("sql IS NOT NULL ORDER BY snum, rowid");
+                schema_query
+            };
+            debug!("Schema query: {schema_query}");
+
+            let (mut stmt, _) = conn.prepare(&schema_query)?.unwrap();
             loop {
                 match stmt.step()? {
                     StepResult::Done => break,
@@ -34,8 +112,7 @@ pub(super) fn process_dot_command(
                             |err| String::from_utf8_lossy(err.as_bytes()),
                             |s| s.into(),
                         );
-                        let _ = writeln!(&mut result.plain, "{};", &sql);
-                        let _ = writeln!(&mut result.html, "<pre><code>{};</code></pre>", &sql);
+                        display_schema(result, &sql);
                     }
                 }
             }
@@ -49,6 +126,11 @@ pub(super) fn process_dot_command(
         }
     }
     Ok(())
+}
+
+fn display_schema(result: &mut SQLiteOutputBuilder, sql: &str) {
+    let _ = writeln!(&mut result.plain, "{}", &sql);
+    let _ = writeln!(&mut result.html, "<pre><code>{}</code></pre>", &sql);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

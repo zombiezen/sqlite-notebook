@@ -15,11 +15,17 @@ use tracing::warn;
 use tracing::{debug, debug_span, error, field, info, trace_span, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Builder as UuidBuilder;
+use zombiezen_const_cstr::const_cstr;
+use zombiezen_sqlite::FunctionFlags;
+use zombiezen_sqlite::ResultCode;
 use zombiezen_sqlite::{Connection, OpenFlags};
 use zombiezen_zmq::{
     Context as ZeroMQContext, Errno, Events, PollItem, RecvFlags, SendFlags, Socket,
 };
 
+use crate::c::cstr_from_osstr;
+
+mod c;
 mod execute;
 mod wire;
 
@@ -116,10 +122,40 @@ fn run(args: Args) -> Result<()> {
         let dir = TempDir::new("sqlite-notebook")?;
         let db_path = dir.path().join("database.sqlite");
         span.record("path", db_path.to_string_lossy().as_ref());
-        let conn = Connection::open(
-            // TODO(now): There should be better ways to do this.
-            CString::new(db_path.to_str().unwrap())?,
-            OpenFlags::default(),
+        let conn = Connection::open(cstr_from_osstr(&db_path), OpenFlags::default())?;
+        conn.create_scalar_function(
+            const_cstr!("shell_add_schema").as_cstr(),
+            Some(3),
+            FunctionFlags::empty(),
+            |ctx, args| {
+                let mut input_value = args.next().unwrap();
+                let input = match input_value.as_mut().text() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
+                        return;
+                    }
+                };
+                let schema = match args.next().unwrap().text() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
+                        return;
+                    }
+                };
+                let name = match args.next().unwrap().text() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
+                        return;
+                    }
+                };
+                if let Some(s) = shell_add_schema_name(input, schema, name) {
+                    ctx.result_text(s);
+                } else {
+                    ctx.result_value(&input_value);
+                }
+            },
         )?;
         (dir, conn)
     };
@@ -358,6 +394,9 @@ where
 fn is_complete(
     request: &wire::IsCompleteRequest,
 ) -> Result<wire::IsCompleteReply, wire::ErrorReply<'static>> {
+    let span = debug_span!("is_complete", status = field::Empty);
+    let _enter = span.enter();
+
     let code = request.code.as_bytes();
     let mut buf = Vec::with_capacity(code.len() + 2);
     buf.extend(code);
@@ -368,6 +407,7 @@ fn is_complete(
     let code = match CString::from_vec_with_nul(buf) {
         Ok(code) => code,
         Err(_) => {
+            span.record("status", format!("{:?}", wire::IsCompleteStatus::Invalid));
             return Ok(wire::IsCompleteReply {
                 status: wire::IsCompleteStatus::Invalid,
                 indent: None,
@@ -375,11 +415,16 @@ fn is_complete(
         }
     };
     if zombiezen_sqlite::is_complete(&code) {
+        span.record("status", format!("{:?}", wire::IsCompleteStatus::Complete));
         Ok(wire::IsCompleteReply {
             status: wire::IsCompleteStatus::Complete,
             indent: None,
         })
     } else {
+        span.record(
+            "status",
+            format!("{:?}", wire::IsCompleteStatus::Incomplete),
+        );
         Ok(wire::IsCompleteReply {
             status: wire::IsCompleteStatus::Incomplete,
             indent: Some(String::new()),
@@ -455,4 +500,54 @@ where
 fn drain_socket(socket: &mut Socket) {
     let mut buf = [0u8; 4096];
     let _ = socket.recv(&mut buf, RecvFlags::default());
+}
+
+fn shell_add_schema_name(input: &str, schema: &str, _name: &str) -> Option<String> {
+    const START: &str = "CREATE ";
+    const PREFIXES: &[&str] = &[
+        "TABLE",
+        "INDEX",
+        "UNIQUE INDEX",
+        "VIEW",
+        "TRIGGER",
+        "VIRTUAL TABLE",
+    ];
+
+    let input = input.strip_prefix(START)?;
+    for prefix in PREFIXES {
+        if let Some(tail) = input.strip_prefix(prefix) {
+            let tail = match tail.strip_prefix(" ") {
+                None => continue,
+                Some(tail) => tail,
+            };
+            let mut buf = String::new();
+            buf.push_str(START);
+            buf.push_str(prefix);
+            buf.push_str(" ");
+            if !schema.is_empty() {
+                // TODO(someday): Quote.
+                buf.push_str(schema);
+                buf.push_str(".");
+            }
+            // TODO(someday): Rename if needed.
+            buf.push_str(tail);
+            return Some(buf);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shell_add_schema_name() {
+        assert_eq!(
+            shell_add_schema_name("CREATE TABLE t1(x)", "xyz", "t1")
+                .as_ref()
+                .map(String::as_str),
+            Some("CREATE TABLE xyz.t1(x)"),
+        );
+    }
 }

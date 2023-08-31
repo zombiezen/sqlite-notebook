@@ -201,7 +201,8 @@ fn run_code(
         match code.bytes().next() {
             Some(b'.') => {
                 let (lineno, _) = str_position(orig_code, orig_code.len() - code.len());
-                dot::process_dot_command(conn, line, lineno, &mut result).map_err(map_err)?;
+                dot::process_dot_command(conn, line, lineno, &mut result)
+                    .map_err(|err| (lineno, 1, err))?;
                 code = tail;
                 continue;
             }

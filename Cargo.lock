@@ -846,6 +846,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zombiezen-const-cstr",
  "zombiezen-sqlite",
  "zombiezen-zmq",
 ]
