@@ -1,5 +1,6 @@
 use std::borrow::Borrow;
 use std::cell::Cell;
+use std::cmp::{min, Ordering};
 use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr};
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -26,11 +27,11 @@ use libsqlite3_sys::{
     sqlite3_column_name, sqlite3_column_text, sqlite3_column_type, sqlite3_column_value,
     sqlite3_complete, sqlite3_db_config, sqlite3_db_handle, sqlite3_finalize, sqlite3_libversion,
     sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_reset, sqlite3_step, sqlite3_stmt,
-    sqlite3_strlike, SQLITE_BLOB, SQLITE_DBCONFIG_DQS_DDL, SQLITE_DBCONFIG_DQS_DML, SQLITE_DONE,
-    SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NOMEM, SQLITE_NULL, SQLITE_OPEN_CREATE,
-    SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY, SQLITE_OPEN_NOMUTEX, SQLITE_OPEN_READONLY,
-    SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE, SQLITE_OPEN_URI, SQLITE_ROW, SQLITE_TEXT,
-    SQLITE_UTF8,
+    sqlite3_strlike, sqlite3_strnicmp, SQLITE_BLOB, SQLITE_DBCONFIG_DQS_DDL,
+    SQLITE_DBCONFIG_DQS_DML, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NOMEM, SQLITE_NULL,
+    SQLITE_OPEN_CREATE, SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY, SQLITE_OPEN_NOMUTEX,
+    SQLITE_OPEN_READONLY, SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE, SQLITE_OPEN_URI,
+    SQLITE_ROW, SQLITE_TEXT, SQLITE_UTF8,
 };
 
 type PhantomUnsend = PhantomData<Rc<()>>;
@@ -655,6 +656,30 @@ pub fn is_complete(s: impl AsRef<CStr>) -> bool {
     }
 }
 
+/// Compare the contents of two strings
+/// using the same definition of case independence that SQLite uses internally
+/// when comparing identifiers.
+pub fn stricmp(left: impl AsRef<str>, right: impl AsRef<str>) -> Ordering {
+    let left = left.as_ref();
+    let right = right.as_ref();
+    let common_length = min(left.len(), right.len());
+
+    let result = unsafe {
+        sqlite3_strnicmp(
+            left.as_ptr() as *const c_char,
+            right.as_ptr() as *const c_char,
+            c_int::try_from(common_length).expect("strings too large"),
+        )
+    };
+    if result > 0 {
+        Ordering::Greater
+    } else if result < 0 {
+        Ordering::Less
+    } else {
+        left.len().cmp(&right.len())
+    }
+}
+
 /// Reports whether `s` matches the [`LIKE`] pattern `glob`
 /// with the given escape character.
 /// For `s LIKE glob` without the `ESCAPE` clause,
@@ -740,6 +765,18 @@ mod tests {
     }
 
     #[test]
+    fn test_stricmp() {
+        assert_eq!(stricmp("", ""), Ordering::Equal);
+        assert_eq!(stricmp("a", "b"), Ordering::Less);
+        assert_eq!(stricmp("b", "a"), Ordering::Greater);
+        assert_eq!(stricmp("a", "B"), Ordering::Less);
+        assert_eq!(stricmp("B", "a"), Ordering::Greater);
+        assert_eq!(stricmp("a", "Aa"), Ordering::Less);
+        assert_eq!(stricmp("Aa", "a"), Ordering::Greater);
+        assert_eq!(stricmp("aA", "Aa"), Ordering::Equal);
+    }
+
+    #[test]
     fn test_strlike() {
         assert!(strlike(const_cstr!("foo"), const_cstr!("foo"), '\x00'));
         assert!(strlike(const_cstr!("%oob%"), const_cstr!("foobar"), '\x00'));
@@ -751,5 +788,13 @@ mod tests {
             const_cstr!("foobar"),
             '\x00'
         ));
+    }
+
+    #[test]
+    fn test_is_complete() {
+        assert!(!is_complete(const_cstr!("select 1")));
+        assert!(is_complete(const_cstr!("select 1;")));
+        assert!(!is_complete(const_cstr!("create table foo (")));
+        // TODO(soon): assert!(!is_complete(const_cstr!("create table foo (;")));
     }
 }

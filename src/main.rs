@@ -16,6 +16,7 @@ use tracing::{debug, debug_span, error, field, info, trace_span, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Builder as UuidBuilder;
 use zombiezen_const_cstr::const_cstr;
+use zombiezen_sqlite::stricmp;
 use zombiezen_sqlite::FunctionFlags;
 use zombiezen_sqlite::ResultCode;
 use zombiezen_sqlite::{Connection, OpenFlags};
@@ -513,12 +514,11 @@ fn shell_add_schema_name(input: &str, schema: &str, _name: &str) -> Option<Strin
         "VIRTUAL TABLE",
     ];
 
-    let input = input.strip_prefix(START)?;
+    let input = strip_iprefix(input, START)?;
     for prefix in PREFIXES {
-        if let Some(tail) = input.strip_prefix(prefix) {
-            let tail = match tail.strip_prefix(" ") {
-                None => continue,
-                Some(tail) => tail,
+        if let Some(tail) = strip_iprefix(input, prefix) {
+            let Some(tail) = tail.strip_prefix(" ") else {
+                continue;
             };
             let mut buf = String::new();
             buf.push_str(START);
@@ -537,6 +537,23 @@ fn shell_add_schema_name(input: &str, schema: &str, _name: &str) -> Option<Strin
     None
 }
 
+fn strip_iprefix<'a, 'b>(s: &'a str, prefix: &'b str) -> Option<&'a str> {
+    let s_char_indices = s.char_indices().map(Some).chain(iter::repeat(None));
+    let mut tail_start = 0usize;
+    for ((prefix_i, prefix_c), s_elem) in prefix.char_indices().zip(s_char_indices) {
+        let Some((s_i, s_c)) = s_elem else {
+            return None;
+        };
+        tail_start = s_i + s_c.len_utf8();
+        let s_slice = &s[s_i..tail_start];
+        let prefix_slice = &s[prefix_i..][..prefix_c.len_utf8()];
+        if stricmp(s_slice, prefix_slice).is_ne() {
+            return None;
+        }
+    }
+    Some(&s[tail_start..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,6 +562,12 @@ mod tests {
     fn test_shell_add_schema_name() {
         assert_eq!(
             shell_add_schema_name("CREATE TABLE t1(x)", "xyz", "t1")
+                .as_ref()
+                .map(String::as_str),
+            Some("CREATE TABLE xyz.t1(x)"),
+        );
+        assert_eq!(
+            shell_add_schema_name("create table t1(x)", "xyz", "t1")
                 .as_ref()
                 .map(String::as_str),
             Some("CREATE TABLE xyz.t1(x)"),
