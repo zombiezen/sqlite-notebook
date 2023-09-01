@@ -1,11 +1,12 @@
 use std::env;
 use std::fmt::Write;
 use std::iter::{FusedIterator, Peekable};
+use std::str;
 
 use anyhow::Result;
 use tracing::debug;
 use zombiezen_const_cstr::const_cstr;
-use zombiezen_sqlite::{Connection, OpenFlags, ResultExt};
+use zombiezen_sqlite::{Connection, OpenFlags, ResultExt, TransactionState};
 
 use crate::c::cstring_until_first_nul;
 
@@ -51,6 +52,42 @@ pub(super) fn process_dot_command(
                     return Ok(());
                 }
             };
+        }
+        "databases" => {
+            let databases = {
+                let (mut stmt, _) = conn.prepare("PRAGMA database_list")?.unwrap();
+                let mut databases = Vec::<(String, String)>::new();
+                while stmt.step()?.has_row() {
+                    databases.push((
+                        stmt.column_text(1).to_string_lossy().into_owned(),
+                        stmt.column_text(2).to_string_lossy().into_owned(),
+                    ));
+                }
+                databases
+            };
+            for (schema, file) in databases {
+                debug!(schema = schema, file = file, "Returning database data");
+                let c_schema = cstring_until_first_nul(schema);
+                let rdonly = conn
+                    .db_readonly(&c_schema)
+                    .expect("database returned from list is now absent");
+                let txn = conn
+                    .txn_state(Some(&c_schema))
+                    .expect("database returned from list is now absent");
+                let _ = writeln!(
+                    &mut result.stdout,
+                    "{schema}: {file} {rdonly}{txn}",
+                    schema =
+                        str::from_utf8(c_schema.as_bytes()).expect("was already UTF-8 encoded"),
+                    file = if file.is_empty() { "\"\"" } else { &file },
+                    rdonly = if rdonly { "r/o" } else { "r/w" },
+                    txn = match txn {
+                        TransactionState::None => "",
+                        TransactionState::Read => " read-txn",
+                        TransactionState::Write => " write-txn",
+                    },
+                );
+            }
         }
         "schema" => {
             if line.args.len() >= 2 {

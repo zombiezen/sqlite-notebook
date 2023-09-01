@@ -14,9 +14,11 @@ use std::{fmt, slice};
 mod bytearray;
 mod function;
 mod result;
+mod txn_state;
 
 pub use function::*;
 pub use result::*;
+pub use txn_state::*;
 
 use bitflags::bitflags;
 use libsqlite3_sys::{
@@ -25,9 +27,9 @@ use libsqlite3_sys::{
     sqlite3_bind_zeroblob64, sqlite3_clear_bindings, sqlite3_close, sqlite3_column_blob,
     sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64,
     sqlite3_column_name, sqlite3_column_text, sqlite3_column_type, sqlite3_column_value,
-    sqlite3_complete, sqlite3_db_config, sqlite3_db_handle, sqlite3_finalize, sqlite3_libversion,
-    sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_reset, sqlite3_step, sqlite3_stmt,
-    sqlite3_strlike, sqlite3_strnicmp, SQLITE_BLOB, SQLITE_DBCONFIG_DQS_DDL,
+    sqlite3_complete, sqlite3_db_config, sqlite3_db_handle, sqlite3_db_readonly, sqlite3_finalize,
+    sqlite3_libversion, sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_reset, sqlite3_step,
+    sqlite3_stmt, sqlite3_strlike, sqlite3_strnicmp, SQLITE_BLOB, SQLITE_DBCONFIG_DQS_DDL,
     SQLITE_DBCONFIG_DQS_DML, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NOMEM, SQLITE_NULL,
     SQLITE_OPEN_CREATE, SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY, SQLITE_OPEN_NOMUTEX,
     SQLITE_OPEN_READONLY, SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE, SQLITE_OPEN_URI,
@@ -89,6 +91,18 @@ impl Conn {
             let tail = sql.split_at(n as usize).1;
             (stmt, tail)
         }))
+    }
+
+    /// Reports whether the given schema is attached as read-only.
+    /// Returns `None` if the argument does not name a database on the connection.
+    pub fn db_readonly(&self, schema: &(impl AsRef<CStr> + ?Sized)) -> Option<bool> {
+        let result = unsafe { sqlite3_db_readonly(self.as_ptr(), schema.as_ref().as_ptr()) };
+        match result {
+            -1 => None,
+            0 => Some(false),
+            1 => Some(true),
+            _ => panic!("unhandled result {} from sqlite3_db_readonly", result),
+        }
     }
 }
 
