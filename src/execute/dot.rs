@@ -5,7 +5,7 @@ use std::iter::{FusedIterator, Peekable};
 use anyhow::Result;
 use tracing::debug;
 use zombiezen_const_cstr::const_cstr;
-use zombiezen_sqlite::{Connection, OpenFlags, StepResult};
+use zombiezen_sqlite::{Connection, OpenFlags, ResultExt};
 
 use crate::c::cstring_until_first_nul;
 
@@ -90,10 +90,8 @@ pub(super) fn process_dot_command(
                 let mut div = "(";
                 let mut schema_query = String::from("SELECT sql FROM");
                 let mut schema_num = 1usize;
-                while database_list_stmt.step()? == StepResult::Row {
-                    let db = database_list_stmt
-                        .column_text(0)
-                        .map_or_else(|err| String::from_utf8_lossy(err.as_bytes()), |s| s.into());
+                while database_list_stmt.step()?.has_row() {
+                    let db = database_list_stmt.column_text(0).to_string_lossy();
                     schema_query.push_str(div);
                     div = " UNION ALL ";
                     schema_query.push_str("SELECT shell_add_schema(sql,");
@@ -128,17 +126,9 @@ pub(super) fn process_dot_command(
             debug!("Schema query: {schema_query}");
 
             let (mut stmt, _) = conn.prepare(&schema_query)?.unwrap();
-            loop {
-                match stmt.step()? {
-                    StepResult::Done => break,
-                    StepResult::Row => {
-                        let sql = stmt.column_text(0).map_or_else(
-                            |err| String::from_utf8_lossy(err.as_bytes()),
-                            |s| s.into(),
-                        );
-                        display_schema(result, &sql);
-                    }
-                }
+            while stmt.step()?.has_row() {
+                let sql = stmt.column_text(0).to_string_lossy();
+                display_schema(result, &sql);
             }
         }
         _ => {

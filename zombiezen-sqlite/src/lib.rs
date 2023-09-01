@@ -1,4 +1,4 @@
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
 use std::cmp::{min, Ordering};
 use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr};
@@ -166,6 +166,31 @@ impl Drop for Connection {
 
 /// A single SQL statement that has been compiled into binary form
 /// and is ready to be evaluated.
+///
+/// # Example
+///
+/// ```rust
+/// # use std::ffi::CString;
+/// # use zombiezen_sqlite::{Connection, OpenFlags, StepResult};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// #     let conn = Connection::open(
+/// #         &CString::new(":memory:")?,
+/// #         OpenFlags::default(),
+/// #     )?;
+/// let (mut stmt, _) = conn.prepare("values (123);")?.unwrap();
+/// # let mut row_count = 0usize;
+/// while stmt.step()?.has_row() {
+///     let col_value = stmt.column_i64(0);
+/// #     assert_eq!(col_value, 123);
+/// #     row_count += 1;
+/// #     if false {
+///     println!("{}", col_value);
+/// #     }
+/// }
+/// #     assert_eq!(row_count, 1);
+/// #     Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct Statement<'c> {
     ptr: NonNull<sqlite3_stmt>,
@@ -432,11 +457,11 @@ impl<'c> Statement<'c> {
     ///
     /// If the column contains [invalid UTF-8],
     /// then `column_text` returns a [`ColumnTextError`].
-    /// This can be used to retrieve the returned byte slice,
-    /// which you can use to pass to [`String::from_utf8_lossy`] for example:
+    /// If replacement is acceptable, you can use [`ResultExt::to_string_lossy`].
     ///
     /// ```rust
     /// use std::borrow::Cow;
+    /// use zombiezen_sqlite::ResultExt;
     /// # use std::ffi::CString;
     /// # use zombiezen_sqlite::{Connection, OpenFlags, StepResult};
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -446,10 +471,7 @@ impl<'c> Statement<'c> {
     /// #     )?;
     /// #     let (mut stmt, _) = conn.prepare("values ('Hello, World!');")?.unwrap();
     /// #     assert_eq!(stmt.step()?, StepResult::Row);
-    /// let s: Cow<str> = stmt.column_text(0).map_or_else(
-    ///     |err| String::from_utf8_lossy(err.as_bytes()),
-    ///     |s| s.into(),
-    /// );
+    /// let s: Cow<str> = stmt.column_text(0).to_string_lossy();
     /// #     assert_eq!(s, "Hello, World!");
     /// #     Ok(())
     /// # }
@@ -574,6 +596,19 @@ impl<'a> std::error::Error for ColumnTextError<'a> {
     }
 }
 
+/// Extension trait for `Result<&str, ColumnTextError>`.
+pub trait ResultExt<'a> {
+    /// Converts the result into a string by replacing invalid UTF-8
+    /// with the Unicode replacement character if needed.
+    fn to_string_lossy(self) -> Cow<'a, str>;
+}
+
+impl<'a> ResultExt<'a> for Result<&'a str, ColumnTextError<'a>> {
+    fn to_string_lossy(self) -> Cow<'a, str> {
+        self.map_or_else(|err| String::from_utf8_lossy(err.as_bytes()), |s| s.into())
+    }
+}
+
 bitflags! {
     #[repr(transparent)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -638,6 +673,17 @@ pub enum StepResult {
     Row = SQLITE_ROW as u8,
     /// Means that the statement has finished executing successfully.
     Done = SQLITE_DONE as u8,
+}
+
+impl StepResult {
+    /// Reports whether the result equals [`StepResult::Row`].
+    #[inline]
+    pub const fn has_row(self) -> bool {
+        match self {
+            Self::Row => true,
+            _ => false,
+        }
+    }
 }
 
 impl From<StepResult> for ResultCode {
