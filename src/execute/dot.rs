@@ -1,17 +1,18 @@
+use std::env;
 use std::fmt::Write;
 use std::iter::{FusedIterator, Peekable};
 
 use anyhow::Result;
 use tracing::debug;
 use zombiezen_const_cstr::const_cstr;
-use zombiezen_sqlite::{Conn, StepResult};
+use zombiezen_sqlite::{Connection, OpenFlags, StepResult};
 
 use crate::c::cstring_until_first_nul;
 
 use super::*;
 
 pub(super) fn process_dot_command(
-    conn: &Conn,
+    conn: &mut Connection,
     line: &str,
     lineno: usize,
     result: &mut SQLiteOutputBuilder,
@@ -28,7 +29,30 @@ pub(super) fn process_dot_command(
         "help" => {
             let _ = writeln!(&mut result.stdout, "This is help.");
         }
-        "s" | "schema" => {
+        "open" => {
+            // TODO(someday): Other flags.
+            if line.args.len() != 1 {
+                let _ = writeln!(&mut result.stderr, "line {lineno}: usage: .open FILENAME");
+                return Ok(());
+            }
+            let cwd = env::current_dir().unwrap_or_else(|_| "<error>".into());
+            debug!(
+                path = line.args[0].as_ref(),
+                cwd = cwd.display().to_string(),
+                "Opening new database"
+            );
+            *conn = match Connection::open(
+                cstring_until_first_nul(line.args[0].as_bytes()),
+                OpenFlags::default(),
+            ) {
+                Ok(conn) => conn,
+                Err(err) => {
+                    let _ = writeln!(&mut result.stderr, "line {lineno}: {}", err);
+                    return Ok(());
+                }
+            };
+        }
+        "schema" => {
             if line.args.len() >= 2 {
                 let _ = writeln!(
                     &mut result.stderr,
