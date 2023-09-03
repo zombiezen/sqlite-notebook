@@ -671,6 +671,12 @@ impl ColumnType {
             _ => None,
         }
     }
+
+    /// Reports whether the column type is equal to [`ColumnType::Null`].
+    #[inline]
+    pub fn is_null(self) -> bool {
+        self == ColumnType::Null
+    }
 }
 
 impl Default for ColumnType {

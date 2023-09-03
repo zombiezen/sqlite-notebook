@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::ffi::{c_char, c_int, c_uchar, c_void, CStr};
 use std::marker::PhantomData;
 use std::mem;
@@ -14,10 +15,11 @@ use crate::{
 use bitflags::bitflags;
 use libsqlite3_sys::{
     sqlite3_context, sqlite3_context_db_handle, sqlite3_create_function_v2, sqlite3_free,
-    sqlite3_malloc, sqlite3_result_error, sqlite3_result_error_code, sqlite3_result_error_toobig,
-    sqlite3_result_text64, sqlite3_result_value, sqlite3_user_data, sqlite3_value,
-    sqlite3_value_bytes, sqlite3_value_dup, sqlite3_value_free, sqlite3_value_text,
-    sqlite3_value_type, SQLITE_DETERMINISTIC, SQLITE_DIRECTONLY, SQLITE_UTF8,
+    sqlite3_get_auxdata, sqlite3_malloc, sqlite3_result_error, sqlite3_result_error_code,
+    sqlite3_result_error_toobig, sqlite3_result_int64, sqlite3_result_text64, sqlite3_result_value,
+    sqlite3_set_auxdata, sqlite3_user_data, sqlite3_value, sqlite3_value_bytes, sqlite3_value_dup,
+    sqlite3_value_free, sqlite3_value_text, sqlite3_value_type, SQLITE_DETERMINISTIC,
+    SQLITE_DIRECTONLY, SQLITE_NULL, SQLITE_UTF8,
 };
 
 type ScalarFn = Box<
@@ -143,6 +145,10 @@ impl Context {
         }
     }
 
+    pub fn result_i64(self: Pin<&mut Self>, v: i64) {
+        unsafe { sqlite3_result_int64(self.as_ptr(), v) }
+    }
+
     pub fn result_text(self: Pin<&mut Self>, v: impl Into<String>) {
         let (ptr, n) = bytearray::new(v.into().into_bytes());
         unsafe {
@@ -155,6 +161,43 @@ impl Context {
             )
         }
     }
+
+    pub fn get_auxdata(&self, arg: usize) -> Option<&dyn Any> {
+        let arg = c_int::try_from(arg).ok()?;
+        let b: &Box<dyn Any> =
+            unsafe { (sqlite3_get_auxdata(self.as_ptr(), arg) as *mut Box<dyn Any>).as_ref() }?;
+        Some(b.as_ref())
+    }
+
+    /// Associates metadata with a non-aggregate SQL function's argument value.
+    /// If the same value is passed to multiple invocations of the same SQL function during query execution,
+    /// under some circumstances the associated metadata may be preserved.
+    /// An example of where this might be useful is in a regular-expression matching function.
+    /// The compiled version of the regular expression
+    /// can be stored as metadata associated with the pattern string.
+    /// Then as long as the pattern string remains the same,
+    /// the compiled regular expression can be reused on multiple invocations of the same function.
+    pub fn set_auxdata(self: Pin<&mut Self>, arg: usize, data: Box<dyn Any>) {
+        let Ok(arg) = c_int::try_from(arg) else {
+            // If the index is out of bounds, then just drop the data.
+            return;
+        };
+        let b: Box<Box<dyn Any>> = Box::new(data); // Need an extra box to hold the thick pointer.
+        let ptr = Box::into_raw(b);
+        unsafe {
+            sqlite3_set_auxdata(
+                self.as_ptr(),
+                arg as c_int,
+                ptr as *mut c_void,
+                Some(destroy_auxdata),
+            );
+        }
+    }
+}
+
+unsafe extern "C" fn destroy_auxdata(ptr: *mut c_void) {
+    let b: Box<Box<dyn Any>> = Box::from_raw(ptr as *mut Box<dyn Any>);
+    drop(b);
 }
 
 #[repr(transparent)]
@@ -165,7 +208,7 @@ pub struct Value<P: ValueProtection> {
 }
 
 impl<P: ValueProtection> Value<P> {
-    pub fn dup(self: &Self) -> DupValue {
+    pub fn dup(&self) -> DupValue {
         DupValue {
             dup_value: NonNull::new(unsafe {
                 sqlite3_value_dup(&self.value as *const sqlite3_value) as *mut Value<Protected>
@@ -177,12 +220,27 @@ impl<P: ValueProtection> Value<P> {
 
 impl Value<Protected> {
     #[inline]
+    unsafe fn as_const_ptr(&self) -> *const sqlite3_value {
+        ptr::addr_of!(self.value)
+    }
+
+    #[inline]
     fn as_ptr(mut self: Pin<&mut Self>) -> *mut sqlite3_value {
         ptr::addr_of_mut!(self.value)
     }
 
-    pub fn r#type(self: Pin<&mut Self>) -> ColumnType {
-        ColumnType::from_int(unsafe { sqlite3_value_type(self.as_ptr()) }).unwrap()
+    /// Reports whether the value represents `NULL`.
+    #[inline]
+    pub fn is_null(&self) -> bool {
+        (unsafe { sqlite3_value_type(self.as_const_ptr() as *mut sqlite3_value) }) == SQLITE_NULL
+    }
+
+    /// Returns the type of the value.
+    pub fn r#type(&self) -> ColumnType {
+        ColumnType::from_int(unsafe {
+            sqlite3_value_type(self.as_const_ptr() as *mut sqlite3_value)
+        })
+        .unwrap()
     }
 
     pub fn text<'a>(mut self: Pin<&'a mut Self>) -> Result<&'a str, ColumnTextError> {

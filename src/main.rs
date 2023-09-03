@@ -3,11 +3,14 @@ use std::fmt;
 use std::fs;
 use std::iter;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::exit;
+use std::rc::Rc;
 
 use anyhow::Result;
 use clap::Parser as ClapParser;
 use rand::{thread_rng, RngCore};
+use re2::RE2;
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use tempdir::TempDir;
@@ -17,8 +20,12 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Builder as UuidBuilder;
 use zombiezen_const_cstr::const_cstr;
 use zombiezen_sqlite::stricmp;
+use zombiezen_sqlite::Context;
 use zombiezen_sqlite::FunctionFlags;
+use zombiezen_sqlite::Protected;
 use zombiezen_sqlite::ResultCode;
+use zombiezen_sqlite::ResultExt;
+use zombiezen_sqlite::Value;
 use zombiezen_sqlite::{Connection, OpenFlags};
 use zombiezen_zmq::{
     Context as ZeroMQContext, Errno, Events, PollItem, RecvFlags, SendFlags, Socket,
@@ -124,6 +131,12 @@ fn run(args: Args) -> Result<()> {
         let db_path = dir.path().join("database.sqlite");
         span.record("path", db_path.to_string_lossy().as_ref());
         let conn = Connection::open(cstr_from_osstr(&db_path), OpenFlags::default())?;
+        conn.create_scalar_function(
+            const_cstr!("regexp").as_cstr(),
+            Some(2),
+            FunctionFlags::DETERMINISTIC,
+            regexp_func,
+        )?;
         conn.create_scalar_function(
             const_cstr!("shell_add_schema").as_cstr(),
             Some(3),
@@ -535,6 +548,47 @@ fn shell_add_schema_name(input: &str, schema: &str, _name: &str) -> Option<Strin
         }
     }
     None
+}
+
+fn regexp_func(
+    mut ctx: Pin<&mut Context>,
+    args: &mut dyn ExactSizeIterator<Item = Pin<&mut Value<Protected>>>,
+) {
+    let pattern_value = args.next().unwrap();
+    let text = args.next().unwrap();
+    if text.is_null() {
+        return;
+    }
+    let text = text.text().to_string_lossy();
+
+    let re = match ctx
+        .as_mut()
+        .get_auxdata(0)
+        .and_then(|data| data.downcast_ref::<Rc<RE2>>().cloned())
+    {
+        Some(re) => re,
+        None => {
+            let pattern = match pattern_value.text() {
+                Ok(pattern) => pattern,
+                Err(err) => {
+                    ctx.result_error(ResultCode::ERROR, &err.to_string());
+                    return;
+                }
+            };
+            match RE2::new(pattern) {
+                Ok(re) => {
+                    let re = Rc::new(re);
+                    ctx.as_mut().set_auxdata(0, Box::new(re.clone()));
+                    re
+                }
+                Err(err) => {
+                    ctx.result_error(ResultCode::ERROR, &err.to_string());
+                    return;
+                }
+            }
+        }
+    };
+    ctx.result_i64(re.easy_match(&text, None) as i64);
 }
 
 fn strip_iprefix<'a, 'b>(s: &'a str, prefix: &'b str) -> Option<&'a str> {

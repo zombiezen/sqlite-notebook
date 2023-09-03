@@ -868,6 +868,7 @@ dependencies = [
  "hex",
  "hmac",
  "rand 0.8.5",
+ "re2",
  "serde",
  "serde_json",
  "sha2",
