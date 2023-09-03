@@ -123,6 +123,9 @@ impl RE2 {
     }
 }
 
+unsafe impl Send for RE2 {}
+unsafe impl Sync for RE2 {}
+
 impl FromStr for RE2 {
     type Err = Error;
 
