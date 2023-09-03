@@ -11,6 +11,7 @@
       let
         pkgs = import nixpkgs {
           inherit system;
+          overlays = [ self.overlays.cre2 ];
         };
       in
       {
@@ -38,5 +39,14 @@
           ];
         };
       }
-    );
+    ) // {
+      # TODO(someday): Remove this once https://github.com/NixOS/nixpkgs/pull/252995
+      # is merged upstream.
+      overlays.cre2 = final: prev: {
+        cre2 = prev.cre2.overrideAttrs (oldAttrs: {
+          buildInputs = builtins.filter (input: input.pname != "re2") oldAttrs.buildInputs;
+          propagatedBuildInputs = [ final.re2 ];
+        });
+      };
+    };
 }

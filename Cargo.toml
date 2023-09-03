@@ -29,7 +29,9 @@ zombiezen-zmq = { path = "./zombiezen-zmq" }
 
 members = [
   ".",
+  "libcre2-sys",
   "libzmq-sys",
+  "re2",
   "zombiezen-sqlite",
   "zombiezen-zmq",
 ]

@@ -1,6 +1,7 @@
 { rustPlatform
 , lib
 , nix-gitignore
+, cre2
 , jq
 , sqlite
 , zeromq
@@ -23,6 +24,7 @@ let pname = "sqlite-notebook"; in rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
 
   buildInputs = [
+    cre2
     sqlite.dev
     zeromq
   ];
