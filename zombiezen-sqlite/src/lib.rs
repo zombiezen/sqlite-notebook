@@ -1,7 +1,7 @@
 use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
 use std::cmp::{min, Ordering};
-use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr};
+use std::ffi::{c_char, c_int, c_uchar, c_uint, CStr};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -12,11 +12,16 @@ use std::str::{self, Utf8Error};
 use std::{fmt, slice};
 
 mod bytearray;
+pub mod column_metadata;
+mod config;
 mod function;
+mod quote;
 mod result;
 mod txn_state;
 
+pub use config::*;
 pub use function::*;
+pub use quote::*;
 pub use result::*;
 pub use txn_state::*;
 
@@ -24,16 +29,16 @@ use bitflags::bitflags;
 use libsqlite3_sys::{
     sqlite3, sqlite3_bind_blob64, sqlite3_bind_double, sqlite3_bind_int64, sqlite3_bind_null,
     sqlite3_bind_parameter_count, sqlite3_bind_parameter_name, sqlite3_bind_text64,
-    sqlite3_bind_zeroblob64, sqlite3_clear_bindings, sqlite3_close, sqlite3_column_blob,
-    sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64,
-    sqlite3_column_name, sqlite3_column_text, sqlite3_column_type, sqlite3_column_value,
-    sqlite3_complete, sqlite3_db_config, sqlite3_db_handle, sqlite3_db_readonly, sqlite3_finalize,
-    sqlite3_libversion, sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_reset, sqlite3_step,
-    sqlite3_stmt, sqlite3_strlike, sqlite3_strnicmp, SQLITE_BLOB, SQLITE_DBCONFIG_DQS_DDL,
-    SQLITE_DBCONFIG_DQS_DML, SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NOMEM, SQLITE_NULL,
-    SQLITE_OPEN_CREATE, SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY, SQLITE_OPEN_NOMUTEX,
-    SQLITE_OPEN_READONLY, SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE, SQLITE_OPEN_URI,
-    SQLITE_ROW, SQLITE_TEXT, SQLITE_UTF8,
+    sqlite3_bind_value, sqlite3_bind_zeroblob64, sqlite3_clear_bindings, sqlite3_close,
+    sqlite3_column_blob, sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_double,
+    sqlite3_column_int64, sqlite3_column_name, sqlite3_column_text, sqlite3_column_type,
+    sqlite3_column_value, sqlite3_complete, sqlite3_db_handle, sqlite3_db_readonly,
+    sqlite3_finalize, sqlite3_libversion, sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_reset,
+    sqlite3_step, sqlite3_stmt, sqlite3_strglob, sqlite3_strlike, sqlite3_strnicmp, SQLITE_BLOB,
+    SQLITE_DONE, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NOMEM, SQLITE_NULL, SQLITE_OPEN_CREATE,
+    SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY, SQLITE_OPEN_NOMUTEX, SQLITE_OPEN_READONLY,
+    SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE, SQLITE_OPEN_URI, SQLITE_ROW, SQLITE_TEXT,
+    SQLITE_UTF8,
 };
 
 type PhantomUnsend = PhantomData<Rc<()>>;
@@ -131,24 +136,12 @@ impl Connection {
             Some(db) => db.cast::<Conn>(),
             None => return Err(ResultCode::NOMEM.to_result().unwrap_err()),
         };
-        let conn = Connection(db); // Now will drop properly.
+        let mut conn = Connection(db); // Now will drop properly.
         if rc != ResultCode::OK {
             return Err(conn.error().unwrap());
         }
-        unsafe {
-            sqlite3_db_config(
-                db.as_ptr() as *mut sqlite3,
-                SQLITE_DBCONFIG_DQS_DML,
-                0 as c_int,
-                ptr::null::<c_void>(),
-            );
-            sqlite3_db_config(
-                db.as_ptr() as *mut sqlite3,
-                SQLITE_DBCONFIG_DQS_DDL,
-                0 as c_int,
-                ptr::null::<c_void>(),
-            );
-        }
+        conn.config(ConfigFlag::DoubleQuotedStringDML, false)?;
+        conn.config(ConfigFlag::DoubleQuotedStringDDL, false)?;
         Ok(conn)
     }
 }
@@ -331,6 +324,15 @@ impl<'c> Statement<'c> {
     /// The first host parameter has an index of 1.
     pub fn bind_null(&mut self, i: usize) -> Result<()> {
         self.bind(i, |stmt, i| unsafe { sqlite3_bind_null(stmt, i) })
+    }
+
+    /// Sets a host parameter in a statement the given value.
+    /// The first host parameter has an index of 1.
+    /// This function operates on both protected and unprotected values.
+    pub fn bind_value<P: ValueProtection>(&mut self, i: usize, v: &Value<P>) -> Result<()> {
+        self.bind(i, |stmt, i| unsafe {
+            sqlite3_bind_value(stmt, i, v.as_const_ptr())
+        })
     }
 
     /// Sets a host parameter in a statement to a 64-bit integer.
@@ -764,6 +766,14 @@ pub fn strlike(glob: impl AsRef<CStr>, s: impl AsRef<CStr>, escape_char: char) -
             escape_char as c_uint,
         )
     }) == 0
+}
+
+/// Reports whether `s` matches the [`GLOB`] pattern `glob`.
+/// This function is case-sensitive.
+///
+/// [`GLOB`]: https://www.sqlite.org/lang_expr.html#glob
+pub fn strglob(glob: impl AsRef<CStr>, s: impl AsRef<CStr>) -> bool {
+    (unsafe { sqlite3_strglob(glob.as_ref().as_ptr(), s.as_ref().as_ptr()) }) == 0
 }
 
 pub fn version() -> &'static str {

@@ -208,10 +208,15 @@ pub struct Value<P: ValueProtection> {
 }
 
 impl<P: ValueProtection> Value<P> {
+    #[inline]
+    pub(crate) unsafe fn as_const_ptr(&self) -> *const sqlite3_value {
+        ptr::addr_of!(self.value)
+    }
+
     pub fn dup(&self) -> DupValue {
         DupValue {
             dup_value: NonNull::new(unsafe {
-                sqlite3_value_dup(&self.value as *const sqlite3_value) as *mut Value<Protected>
+                sqlite3_value_dup(self.as_const_ptr()) as *mut Value<Protected>
             })
             .expect("out of memory"),
         }
@@ -219,11 +224,6 @@ impl<P: ValueProtection> Value<P> {
 }
 
 impl Value<Protected> {
-    #[inline]
-    unsafe fn as_const_ptr(&self) -> *const sqlite3_value {
-        ptr::addr_of!(self.value)
-    }
-
     #[inline]
     fn as_ptr(mut self: Pin<&mut Self>) -> *mut sqlite3_value {
         ptr::addr_of_mut!(self.value)
