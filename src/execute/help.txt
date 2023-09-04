@@ -1,0 +1,5 @@
+.databases         List names and files of attached databases
+.help              Show help text
+.open FILE         Close existing database and reopen FILE
+.read FILE         Read input from FILE
+.schema ?PATTERN?  Show the CREATE statements matching PATTERN

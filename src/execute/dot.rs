@@ -29,7 +29,7 @@ pub(super) fn process_dot_command<'a>(
     };
     match line.name {
         "help" => {
-            let _ = writeln!(&mut result.stdout, "This is help.");
+            result.stdout.push_str(include_str!("help.txt"));
         }
         "open" => {
             // TODO(someday): Other flags.
