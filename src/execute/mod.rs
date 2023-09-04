@@ -3,18 +3,22 @@ use std::collections::HashMap;
 use std::fmt::{self, Write};
 use std::iter;
 use std::mem;
+use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use csv::{Writer as CsvWriter, WriterBuilder as CsvWriterBuilder};
 use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::json;
 use tracing::{debug_span, field};
-use zombiezen_sqlite::{ColumnType, Connection, ResultExt};
+use zombiezen_sqlite::{ColumnType, Connection, ResultExt, StepResult};
 use zombiezen_zmq::Socket;
 
 use crate::{reply, wire};
 
+use self::position::Position;
+
 mod dot;
+mod position;
 
 pub(crate) fn execute<S, K, P>(
     session_id: &str,
@@ -88,49 +92,52 @@ where
         ..wire::ErrorReply::new("IOError")
     })?;
 
-    match run_code(conn, &req_content.code) {
-        Ok(mut data) => {
-            if data.is_empty() {
-                let _ = reply(
-                    session_id,
-                    auth,
-                    io_pub_socket,
-                    "clear_output",
-                    iter::empty::<Vec<u8>>(),
-                    message.raw_header(),
-                    &json!({
-                        "wait": false,
-                    }),
-                );
-            }
-            if !data.stdout.is_empty() {
-                let _ = reply(
-                    session_id,
-                    auth,
-                    io_pub_socket,
-                    "stream",
-                    iter::empty::<Vec<u8>>(),
-                    message.raw_header(),
-                    &json!({
-                        "name": "stdout",
-                        "text": mem::take(&mut data.stdout),
-                    }),
-                );
-            }
-            if !data.stderr.is_empty() {
-                let _ = reply(
-                    session_id,
-                    auth,
-                    io_pub_socket,
-                    "stream",
-                    iter::empty::<Vec<u8>>(),
-                    message.raw_header(),
-                    &json!({
-                        "name": "stderr",
-                        "text": mem::take(&mut data.stderr),
-                    }),
-                );
-            }
+    let mut data = SQLiteOutputBuilder::new();
+    let result = run_code(conn, None, &req_content.code, &mut data);
+    let mut data = data.finish();
+    if data.is_empty() {
+        let _ = reply(
+            session_id,
+            auth,
+            io_pub_socket,
+            "clear_output",
+            iter::empty::<Vec<u8>>(),
+            message.raw_header(),
+            &json!({
+                "wait": false,
+            }),
+        );
+    }
+    if !data.stdout.is_empty() {
+        let _ = reply(
+            session_id,
+            auth,
+            io_pub_socket,
+            "stream",
+            iter::empty::<Vec<u8>>(),
+            message.raw_header(),
+            &json!({
+                "name": "stdout",
+                "text": mem::take(&mut data.stdout),
+            }),
+        );
+    }
+    if !data.stderr.is_empty() {
+        let _ = reply(
+            session_id,
+            auth,
+            io_pub_socket,
+            "stream",
+            iter::empty::<Vec<u8>>(),
+            message.raw_header(),
+            &json!({
+                "name": "stderr",
+                "text": mem::take(&mut data.stderr),
+            }),
+        );
+    }
+    match result {
+        Ok(()) => {
             reply(
                 session_id,
                 auth,
@@ -155,9 +162,9 @@ where
                 user_expressions: HashMap::new(),
             })
         }
-        Err((lineno, col, err)) => {
+        Err((position, err)) => {
             let err_string = err.to_string();
-            let traceback = format!("{}:{}: {}", lineno, col, &err_string);
+            let traceback = format!("{position}: {err_string}");
             let err_reply = wire::ErrorReply {
                 execution_count: Some(execution_count),
                 traceback: vec![traceback.into()],
@@ -183,35 +190,42 @@ where
     }
 }
 
-fn run_code(
+fn run_code<'a>(
     conn: &mut Connection,
+    file_name: Option<&'a Path>,
     mut code: &str,
-) -> Result<SQLiteOutput, (usize, usize, zombiezen_sqlite::Error)> {
-    let mut result = SQLiteOutputBuilder::new();
-    let orig_code = code;
-    let map_err = |err: zombiezen_sqlite::Error| {
-        let offset = orig_code.len() - code.len() + err.error_offset().unwrap_or(0);
-        let (lineno, col) = str_position(orig_code, offset);
-        (lineno, col, err)
-    };
+    result: &mut SQLiteOutputBuilder,
+) -> Result<(), (Position<Cow<'a, Path>>, zombiezen_sqlite::Error)> {
+    let mut position = Position::start_of(file_name.map(|f| Cow::Borrowed(f)));
     while !code.is_empty() {
         // Check for special directives.
-        let (line, tail) = cut(code, "\n");
-        let tail = tail.unwrap_or("");
+        let (line, advance_str, tail) = {
+            const SEP: &str = "\n";
+            match code.find(SEP) {
+                Some(i) => (&code[..i], &code[..i + SEP.len()], &code[i + SEP.len()..]),
+                None => (code, code, ""),
+            }
+        };
         match code.bytes().next() {
             Some(b'.') => {
-                let (lineno, _) = str_position(orig_code, orig_code.len() - code.len());
-                dot::process_dot_command(conn, line, lineno, &mut result)
-                    .map_err(|err| (lineno, 1, err))?;
+                let dot_command_position = {
+                    let mut pos = position.clone();
+                    pos.clear_column();
+                    pos
+                };
+                dot::process_dot_command(conn, dot_command_position, line, result)?;
+                position.advance(advance_str);
                 code = tail;
                 continue;
             }
             Some(b'#') => {
+                position.advance(advance_str);
                 code = tail;
                 continue;
             }
             _ => {
                 if line.chars().all(char::is_whitespace) {
+                    position.advance(advance_str);
                     code = tail;
                     continue;
                 }
@@ -219,9 +233,15 @@ fn run_code(
         }
 
         // It's SQL!
-        let (mut stmt, tail) = match conn.prepare(code).map_err(map_err)? {
-            Some(x) => x,
-            None => break,
+        let (mut stmt, tail) = match conn.prepare(code) {
+            Ok(Some(x)) => x,
+            Ok(None) => break,
+            Err(err) => {
+                if let Some(offset) = err.error_offset() {
+                    position.advance(code.get(..offset).unwrap_or_default());
+                }
+                return Err((position, err));
+            }
         };
 
         let column_count = stmt.column_count();
@@ -237,7 +257,18 @@ fn run_code(
             }
             result.html.push_str("</tr></thead>\n<tbody>\n");
         }
-        while stmt.step().map_err(map_err)?.has_row() {
+        loop {
+            match stmt.step() {
+                Ok(StepResult::Row) => {}
+                Ok(StepResult::Done) => break,
+                Err(err) => {
+                    if let Some(offset) = err.error_offset() {
+                        position.advance(code.get(..offset).unwrap_or_default());
+                    }
+                    return Err((position, err));
+                }
+            }
+
             result.html.push_str("<tr>");
             for i in 0..column_count {
                 if i > 0 {
@@ -287,9 +318,10 @@ fn run_code(
         if column_count > 0 {
             result.html.push_str("</tbody></table>\n");
         }
+        position.advance(advance_str);
         code = tail;
     }
-    Ok(result.finish())
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -372,24 +404,6 @@ impl Default for SQLiteOutputBuilder {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn str_position(s: &str, off: usize) -> (usize, usize) {
-    let mut lineno = 1;
-    let mut col = 1;
-    for c in s[..off].chars() {
-        // TODO(soon): Tabs.
-        match c {
-            '\n' => {
-                lineno += 1;
-                col = 1;
-            }
-            _ => {
-                col += 1;
-            }
-        }
-    }
-    (lineno, col)
 }
 
 fn cut<'a, 'b>(s: &'a str, sep: &'b str) -> (&'a str, Option<&'a str>) {

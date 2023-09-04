@@ -1,29 +1,30 @@
-use std::env;
 use std::fmt::Write;
 use std::iter::{FusedIterator, Peekable};
 use std::str;
+use std::{env, fs};
 
 use anyhow::Result;
 use tracing::debug;
 use zombiezen_const_cstr::const_cstr;
-use zombiezen_sqlite::{Connection, OpenFlags, ResultExt, TransactionState};
+use zombiezen_sqlite::{Connection, OpenFlags, ResultCode, ResultExt, TransactionState};
 
 use crate::c::cstring_until_first_nul;
 
 use super::*;
 
-pub(super) fn process_dot_command(
+pub(super) fn process_dot_command<'a>(
     conn: &mut Connection,
+    position: Position<Cow<'a, Path>>,
     line: &str,
-    lineno: usize,
     result: &mut SQLiteOutputBuilder,
-) -> Result<(), zombiezen_sqlite::Error> {
+) -> Result<(), (Position<Cow<'a, Path>>, zombiezen_sqlite::Error)> {
     let line = match DotCommandLine::from_str(line) {
         Ok(line) => line,
         Err(err) => {
-            let err_str = err.to_string();
-            let _ = writeln!(&mut result.stderr, "line {lineno}: {}", &err_str);
-            return Ok(());
+            return Err((
+                position,
+                zombiezen_sqlite::Error::new(ResultCode::ERROR, err.to_string()),
+            ));
         }
     };
     match line.name {
@@ -33,8 +34,13 @@ pub(super) fn process_dot_command(
         "open" => {
             // TODO(someday): Other flags.
             if line.args.len() != 1 {
-                let _ = writeln!(&mut result.stderr, "line {lineno}: usage: .open FILENAME");
-                return Ok(());
+                return Err((
+                    position,
+                    zombiezen_sqlite::Error::new(
+                        ResultCode::MISUSE,
+                        "usage: .open FILE".to_string(),
+                    ),
+                ));
             }
             let cwd = env::current_dir().unwrap_or_else(|_| "<error>".into());
             debug!(
@@ -47,21 +53,65 @@ pub(super) fn process_dot_command(
                 OpenFlags::default(),
             ) {
                 Ok(conn) => conn,
-                Err(err) => {
-                    let _ = writeln!(&mut result.stderr, "line {lineno}: {}", err);
-                    return Ok(());
+                Err(mut err) => {
+                    err.clear_error_offset();
+                    return Err((position, err));
                 }
             };
         }
+        "read" => {
+            if line.args.len() != 1 {
+                return Err((
+                    position,
+                    zombiezen_sqlite::Error::new(
+                        ResultCode::MISUSE,
+                        "usage: .read FILE".to_string(),
+                    ),
+                ));
+            }
+            let cwd = env::current_dir().unwrap_or_else(|_| "<error>".into());
+            debug!(
+                path = line.args[0].as_ref(),
+                cwd = cwd.display().to_string(),
+                "Reading SQL file"
+            );
+            let path: &Path = line.args[0].as_ref().as_ref();
+            let contents = fs::read(path).map_err(|err| {
+                (
+                    position,
+                    zombiezen_sqlite::Error::new(ResultCode::IOERR, err.to_string()),
+                )
+            })?;
+            let contents = String::from_utf8_lossy(&contents);
+            run_code(conn, Some(path), &contents, result).map_err(|(position, err)| {
+                (position.map_file_name(|f| Cow::Owned(f.into_owned())), err)
+            })?;
+        }
         "databases" => {
             let databases = {
-                let (mut stmt, _) = conn.prepare("PRAGMA database_list")?.unwrap();
+                let (mut stmt, _) = match conn.prepare("PRAGMA database_list") {
+                    Ok(Some(x)) => x,
+                    Ok(_) => unreachable!("Statement not empty"),
+                    Err(mut err) => {
+                        err.clear_error_offset();
+                        return Err((position, err));
+                    }
+                };
                 let mut databases = Vec::<(String, String)>::new();
-                while stmt.step()?.has_row() {
-                    databases.push((
-                        stmt.column_text(1).to_string_lossy().into_owned(),
-                        stmt.column_text(2).to_string_lossy().into_owned(),
-                    ));
+                loop {
+                    match stmt.step() {
+                        Ok(StepResult::Done) => break,
+                        Ok(StepResult::Row) => {
+                            databases.push((
+                                stmt.column_text(1).to_string_lossy().into_owned(),
+                                stmt.column_text(2).to_string_lossy().into_owned(),
+                            ));
+                        }
+                        Err(mut err) => {
+                            err.clear_error_offset();
+                            return Err((position, err));
+                        }
+                    }
                 }
                 databases
             };
@@ -91,11 +141,13 @@ pub(super) fn process_dot_command(
         }
         "schema" => {
             if line.args.len() >= 2 {
-                let _ = writeln!(
-                    &mut result.stderr,
-                    "line {lineno}: usage: .schema ?LIKE-PATTERN?"
-                );
-                return Ok(());
+                return Err((
+                    position,
+                    zombiezen_sqlite::Error::new(
+                        ResultCode::MISUSE,
+                        "usage: .schema ?LIKE-PATTERN?".to_string(),
+                    ),
+                ));
             }
 
             if let Some(pattern) = line.args.get(0) {
@@ -121,28 +173,43 @@ pub(super) fn process_dot_command(
             }
 
             let schema_query = {
-                let (mut database_list_stmt, _) = conn
-                    .prepare("SELECT name FROM pragma_database_list")?
-                    .unwrap();
+                let mut database_list_stmt =
+                    match conn.prepare("SELECT name FROM pragma_database_list") {
+                        Ok(Some((stmt, _))) => stmt,
+                        Ok(None) => unreachable!("Statement not empty"),
+                        Err(mut err) => {
+                            err.clear_error_offset();
+                            return Err((position, err));
+                        }
+                    };
                 let mut div = "(";
                 let mut schema_query = String::from("SELECT sql FROM");
                 let mut schema_num = 1usize;
-                while database_list_stmt.step()?.has_row() {
-                    let db = database_list_stmt.column_text(0).to_string_lossy();
-                    schema_query.push_str(div);
-                    div = " UNION ALL ";
-                    schema_query.push_str("SELECT shell_add_schema(sql,");
-                    // TODO(soon): Really need to quote/escape this all better.
-                    if db != "main" {
-                        write!(&mut schema_query, "'{}'", db).unwrap();
-                    } else {
-                        schema_query.push_str("NULL");
+                loop {
+                    match database_list_stmt.step() {
+                        Ok(StepResult::Done) => break,
+                        Ok(StepResult::Row) => {
+                            let db = database_list_stmt.column_text(0).to_string_lossy();
+                            schema_query.push_str(div);
+                            div = " UNION ALL ";
+                            schema_query.push_str("SELECT shell_add_schema(sql,");
+                            // TODO(soon): Really need to quote/escape this all better.
+                            if db != "main" {
+                                write!(&mut schema_query, "'{}'", db).unwrap();
+                            } else {
+                                schema_query.push_str("NULL");
+                            }
+                            schema_query.push_str(",name) AS sql, type, tbl_name, name, rowid,");
+                            write!(&mut schema_query, "{schema_num} AS snum, ").unwrap();
+                            schema_num += 1;
+                            write!(&mut schema_query, "'{db}' AS sname ").unwrap();
+                            write!(&mut schema_query, "FROM {db}.sqlite_schema").unwrap();
+                        }
+                        Err(mut err) => {
+                            err.clear_error_offset();
+                            return Err((position, err));
+                        }
                     }
-                    schema_query.push_str(",name) AS sql, type, tbl_name, name, rowid,");
-                    write!(&mut schema_query, "{schema_num} AS snum, ").unwrap();
-                    schema_num += 1;
-                    write!(&mut schema_query, "'{db}' AS sname ").unwrap();
-                    write!(&mut schema_query, "FROM {db}.sqlite_schema").unwrap();
                 }
 
                 schema_query.push_str(") WHERE ");
@@ -162,18 +229,36 @@ pub(super) fn process_dot_command(
             };
             debug!("Schema query: {schema_query}");
 
-            let (mut stmt, _) = conn.prepare(&schema_query)?.unwrap();
-            while stmt.step()?.has_row() {
-                let sql = stmt.column_text(0).to_string_lossy();
-                display_schema(result, &sql);
+            let mut stmt = match conn.prepare(&schema_query) {
+                Ok(Some((stmt, _))) => stmt,
+                Ok(None) => unreachable!("Statement not empty"),
+                Err(mut err) => {
+                    err.clear_error_offset();
+                    return Err((position, err));
+                }
+            };
+            loop {
+                match stmt.step() {
+                    Ok(StepResult::Done) => break,
+                    Ok(StepResult::Row) => {
+                        let sql = stmt.column_text(0).to_string_lossy();
+                        display_schema(result, &sql);
+                    }
+                    Err(mut err) => {
+                        err.clear_error_offset();
+                        return Err((position, err));
+                    }
+                }
             }
         }
         _ => {
-            let _ = writeln!(
-                &mut result.stderr,
-                "line {lineno}: unknown dot command {}",
-                &line.name
-            );
+            return Err((
+                position,
+                zombiezen_sqlite::Error::new(
+                    ResultCode::ERROR,
+                    format!("unknown dot command {}", &line.name),
+                ),
+            ));
         }
     }
     Ok(())

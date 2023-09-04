@@ -165,6 +165,13 @@ impl Error {
         self.error_offset
     }
 
+    /// Sets the error offset to `None`.
+    /// Useful for masking the error offset when returning the error up the call stack.
+    #[inline]
+    pub fn clear_error_offset(&mut self) {
+        self.error_offset = None;
+    }
+
     pub fn message(&self) -> &str {
         if self.msg.is_empty() {
             self.result_code.message()
