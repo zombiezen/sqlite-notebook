@@ -29,7 +29,16 @@ pub(super) fn process_dot_command<'a>(
     };
     match line.name {
         "help" => {
-            result.stdout.push_str(include_str!("help.txt"));
+            if line.args.len() > 1 {
+                return Err((
+                    position,
+                    zombiezen_sqlite::Error::new(
+                        ResultCode::MISUSE,
+                        "usage: .help ?-all? ?PATTERN?".to_string(),
+                    ),
+                ));
+            }
+            display_help(&mut result.stdout, line.args.get(0).map(AsRef::as_ref));
         }
         "open" => {
             // TODO(someday): Other flags.
@@ -269,6 +278,71 @@ fn display_schema(result: &mut SQLiteOutputBuilder, sql: &str) {
     let _ = writeln!(&mut result.html, "<pre><code>{}</code></pre>", &sql);
 }
 
+const HELP: &str = include_str!("help.txt");
+
+fn display_help(result: &mut String, pattern: Option<&str>) {
+    match pattern {
+        Some("-a") | Some("-all") | Some("--all") => result.push_str(HELP),
+        None => {
+            for line in HELP.lines().filter(|l| l.starts_with(".")) {
+                result.push_str(line);
+                result.push_str("\n");
+            }
+        }
+        Some(pattern) => {
+            // Seek documented commands for which the pattern is an exact prefix.
+            {
+                let mut iter = HELP.lines();
+                let mut details = None;
+                let mut n = 0usize;
+                let glob_pattern = cstring_until_first_nul(format!(".{}*", pattern));
+                while let Some(line) = iter.next() {
+                    if zombiezen_sqlite::strglob(&glob_pattern, cstring_until_first_nul(line)) {
+                        result.push_str(line);
+                        result.push_str("\n");
+                        n += 1;
+                        if n == 1 {
+                            details = Some(iter.clone().take_while(|line| !line.starts_with(".")));
+                        } else {
+                            details = None;
+                        }
+                    }
+                }
+                if let Some(details) = details {
+                    for line in details {
+                        result.push_str(line);
+                        result.push_str("\n");
+                    }
+                }
+                if n > 0 {
+                    return;
+                }
+            }
+
+            // Look for documented commands that contain the pattern anywhere.
+            // Show complete text of all documented commands that match.
+            let like_pattern = cstring_until_first_nul(format!("%{}%", pattern));
+            let mut iter = HELP.lines().peekable();
+            while let Some(line) = iter.next() {
+                if line.starts_with(".")
+                    && zombiezen_sqlite::strlike(
+                        &like_pattern,
+                        cstring_until_first_nul(&line[1..]),
+                        '\x00',
+                    )
+                {
+                    result.push_str(line);
+                    result.push_str("\n");
+                    while let Some(line) = iter.by_ref().next_if(|line| !line.starts_with(".")) {
+                        result.push_str(line);
+                        result.push_str("\n");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DotCommandLine<'a> {
     name: &'a str,
@@ -464,6 +538,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_display_help_prefix() {
+        let mut output = String::new();
+        display_help(&mut output, Some("rea"));
+        assert!(
+            output.starts_with(".read "),
+            "{:?} should start with .read",
+            &output
+        );
+        assert!(
+            output.ends_with("\n"),
+            "{:?} should end with newline",
+            &output
+        );
+        assert_eq!(
+            output.chars().filter(|&c| c == '\n').count(),
+            1,
+            "{:?} should only be one line",
+            &output
+        );
+    }
 
     #[test]
     fn test_dot_command_line() {

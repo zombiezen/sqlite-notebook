@@ -1,5 +1,12 @@
-.databases         List names and files of attached databases
-.help              Show help text
-.open FILE         Close existing database and reopen FILE
-.read FILE         Read input from FILE
-.schema ?PATTERN?  Show the CREATE statements matching PATTERN
+.databases               List names and files of attached databases
+.help ?-all? ?PATTERN?   Show help text for PATTERN
+.open FILE               Close existing database and reopen FILE
+.parameter CMD ...       Manage SQL parameter bindings
+   clear                   Erase all bindings
+   init                    Initialize the TEMP table that holds bindings
+   list                    List the current parameter bindings
+   set PARAMETER VALUE     Given SQL parameter PARAMETER a value of VALUE
+                           PARAMETER should start with one of: $ : @ ?
+   unset PARAMETER         Remove PARAMETER from the binding table
+.read FILE               Read input from FILE
+.schema ?PATTERN?        Show the CREATE statements matching PATTERN
