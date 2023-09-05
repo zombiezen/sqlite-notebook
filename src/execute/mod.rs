@@ -10,7 +10,7 @@ use csv::{Writer as CsvWriter, WriterBuilder as CsvWriterBuilder};
 use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::json;
 use tracing::{debug_span, field};
-use zombiezen_sqlite::{ColumnType, Connection, ResultExt, Statement, StepResult};
+use zombiezen_sqlite::{Connection, DataType, ResultExt, Statement, StepResult};
 use zombiezen_zmq::Socket;
 
 use crate::{reply, wire};
@@ -244,7 +244,7 @@ fn run_code<'a>(
                 return Err((position, err));
             }
         };
-        if let Err(err) = parameter::bind_prepared_stmt(conn.as_ref(), &mut stmt) {
+        if let Err(err) = parameter::bind_prepared_stmt(conn, &mut stmt) {
             if let Some(offset) = err.error_offset() {
                 position.advance(code.get(..offset).unwrap_or_default());
             }
@@ -298,11 +298,11 @@ fn run_code<'a>(
 
 fn show_cell(result: &mut SQLiteOutputBuilder, stmt: &mut Statement, i: usize) {
     match stmt.column_type(i) {
-        ColumnType::Null => {
+        DataType::Null => {
             result.html.push_str("<td><code>NULL</code></td>");
             result.csv.write_field(b"").unwrap();
         }
-        ColumnType::Blob => {
+        DataType::Blob => {
             let bytes = stmt.column_blob(i);
             let hex = hex::encode_upper(bytes);
             match std::str::from_utf8(bytes) {

@@ -68,9 +68,10 @@ impl<'c> Statement<'c> {
     }
 
     /// Evaluate the statement, stopping at the next row returned.
-    /// Once [`StepResult::Done`] is returned,
+    /// Once [`Done`][StepResult::Done] is returned,
     /// the statement has finished executing successfully
-    /// and `step` should not be called again without first calling [`reset`].
+    /// and `step` should not be called again
+    /// without first calling [`reset`][Statement::reset].
     pub fn step(&mut self) -> Result<StepResult> {
         let rc = ResultCode(unsafe { sqlite3_step(self.ptr) });
         match rc {
@@ -95,7 +96,8 @@ impl<'c> Statement<'c> {
     /// Even if there were no previous errors, `reset` may still return an error
     /// in the case that a new error was caused by resetting the statement.
     ///
-    /// This does not change the bindings: use [`clear_bindings`] to do that.
+    /// This does not change the bindings:
+    /// use [`clear_bindings`][Statement::clear_bindings] to do that.
     pub fn reset(&mut self) -> Result<()> {
         self.has_row = false;
         let rc = ResultCode(unsafe { sqlite3_reset(self.ptr) });
@@ -276,16 +278,19 @@ impl<'c> Statement<'c> {
     /// Returns the datatype of the value in the `i`th column.
     /// The leftmost column is number 0.
     /// The return value is undefined after calling any of
-    /// [`column_i64`], [`column_f64`], [`column_text`], or [`column_blob`]
+    /// [`column_i64`][Statement::column_i64],
+    /// [`column_f64`][Statement::column_f64],
+    /// [`column_text`][Statement::column_text],
+    /// or [`column_blob`][Statement::column_blob]
     /// on the column, as these can all perform conversions.
     ///
     /// # Panics
     ///
     /// Panics if the statement has not returned a row
     /// or if `i >= self.column_count()`.
-    pub fn column_type(&self, i: usize) -> ColumnType {
+    pub fn column_type(&self, i: usize) -> DataType {
         self.check_col(i);
-        ColumnType::from_int(unsafe { sqlite3_column_type(self.ptr, i as c_int) })
+        DataType::from_int(unsafe { sqlite3_column_type(self.ptr, i as c_int) })
             .expect("SQLite returned an unknown column type")
     }
 
@@ -328,7 +333,7 @@ impl<'c> Statement<'c> {
     /// # Errors
     ///
     /// If the column contains [invalid UTF-8],
-    /// then `column_text` returns a [`ColumnTextError`].
+    /// then `column_text` returns a [`TextError`].
     /// If replacement is acceptable, you can use [`ResultExt::to_string_lossy`].
     ///
     /// ```rust
@@ -356,17 +361,18 @@ impl<'c> Statement<'c> {
     ///
     /// Panics if the statement has not returned a row
     /// or if `i >= self.column_count()`.
-    pub fn column_text(&mut self, i: usize) -> Result<&str, ColumnTextError> {
+    pub fn column_text(&mut self, i: usize) -> Result<&str, TextError> {
         self.check_col(i);
-        let bytes = unsafe {
+        let bytes_with_nul = unsafe {
             let ptr = sqlite3_column_text(self.ptr, i as c_int);
             if ptr.is_null() {
                 return Ok("");
             }
             let n = sqlite3_column_bytes(self.ptr, i as c_int);
-            slice::from_raw_parts(ptr, n as usize)
+            slice::from_raw_parts(ptr, (n as usize) + 1)
         };
-        str::from_utf8(bytes).map_err(|err| ColumnTextError::new(bytes, err))
+        str::from_utf8(&bytes_with_nul[..bytes_with_nul.len() - 1])
+            .map_err(|err| TextError::new(bytes_with_nul, err))
     }
 
     /// Returns the value in the `i`th column as a `BLOB` (byte slice),
@@ -433,24 +439,36 @@ impl<'c> Drop for Statement<'c> {
     }
 }
 
-/// An error value encountered when a column value contains
+/// An error value encountered when a value contains
 /// [invalid UTF-8](https://www.sqlite.org/invalidutf.html).
 #[derive(Clone, Copy, Debug)]
-pub struct ColumnTextError<'a> {
-    bytes: &'a [u8],
+pub struct TextError<'a> {
+    bytes_with_nul: &'a [u8],
     err: Utf8Error,
 }
 
-impl<'a> ColumnTextError<'a> {
+impl<'a> TextError<'a> {
     #[inline]
-    pub(crate) fn new(bytes: &'a [u8], err: Utf8Error) -> Self {
-        ColumnTextError { bytes, err }
+    pub(crate) fn new(bytes_with_nul: &'a [u8], err: Utf8Error) -> Self {
+        assert!(bytes_with_nul.ends_with(b"\x00"));
+        TextError {
+            bytes_with_nul,
+            err,
+        }
     }
 
-    /// Returns a slice of bytes that were attempt to convert to a `&str`.
+    /// Returns the slice of bytes that were attempt to convert to a `&str`.
     #[inline]
     pub fn as_bytes(&self) -> &'a [u8] {
-        self.bytes
+        &self.bytes_with_nul[..self.bytes_with_nul.len() - 1]
+    }
+
+    /// Returns the slice of bytes as a C-style string
+    /// terminated at the first NUL byte.
+    #[inline]
+    pub fn as_cstr(&self) -> &CStr {
+        CStr::from_bytes_until_nul(self.bytes_with_nul)
+            .expect("NUL byte was validated in TextError::new")
     }
 
     /// Fetch a [`Utf8Error`] to get more details about the conversion failure.
@@ -460,19 +478,19 @@ impl<'a> ColumnTextError<'a> {
     }
 }
 
-impl<'a> fmt::Display for ColumnTextError<'a> {
+impl<'a> fmt::Display for TextError<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.err, f)
     }
 }
 
-impl<'a> std::error::Error for ColumnTextError<'a> {
+impl<'a> std::error::Error for TextError<'a> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.err)
     }
 }
 
-/// A subset of [`ResultCode`] returned by [`Stmt::step`].
+/// A subset of [`ResultCode`] returned by [`Statement::step`].
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum StepResult {
@@ -528,7 +546,6 @@ mod tests {
     fn test_read_values() {
         let conn = Connection::open(MEMORY, OpenFlags::default()).unwrap();
         let (mut stmt, _) = conn
-            .as_ref()
             .prepare("select 123 as \"int\", 'foo' as \"text\", null as \"null\";")
             .unwrap()
             .expect("statement is not empty");
@@ -539,15 +556,12 @@ mod tests {
         assert_eq!(stmt.column_name(3), None);
 
         assert_eq!(stmt.step().unwrap(), StepResult::Row);
-        assert_eq!(stmt.column_type(0), ColumnType::Integer);
+        assert_eq!(stmt.column_type(0), DataType::Integer);
         assert_eq!(stmt.column_i64(0), 123);
-        assert_eq!(stmt.column_type(1), ColumnType::Text);
+        assert_eq!(stmt.column_type(1), DataType::Text);
         assert_eq!(stmt.column_text(1).unwrap(), "foo");
-        assert_eq!(stmt.column_type(2), ColumnType::Null);
-        assert_eq!(
-            stmt.column_value(2).dup().as_mut().r#type(),
-            ColumnType::Null
-        );
+        assert_eq!(stmt.column_type(2), DataType::Null);
+        assert_eq!(stmt.column_value(2).dup().as_mut().r#type(), DataType::Null);
 
         assert_eq!(stmt.step().unwrap(), StepResult::Done);
     }
@@ -563,7 +577,7 @@ mod tests {
         stmt.bind_text(1, WANT).unwrap();
 
         assert_eq!(stmt.step().unwrap(), StepResult::Row);
-        assert_eq!(stmt.column_type(0), ColumnType::Text);
+        assert_eq!(stmt.column_type(0), DataType::Text);
         assert_eq!(stmt.column_text(0).unwrap(), WANT);
 
         assert_eq!(stmt.step().unwrap(), StepResult::Done);

@@ -137,7 +137,7 @@ fn run(args: Args) -> Result<()> {
             FunctionFlags::empty(),
             |mut ctx, args| {
                 let mut input_value = args.next().unwrap();
-                let input = match input_value.text() {
+                let input = match input_value.to_text() {
                     Ok(s) => s,
                     Err(_) => {
                         ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
@@ -145,7 +145,7 @@ fn run(args: Args) -> Result<()> {
                     }
                 };
                 let mut schema_value = args.next().unwrap();
-                let schema = match schema_value.text() {
+                let schema = match schema_value.to_text() {
                     Ok(s) => s,
                     Err(_) => {
                         ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
@@ -153,7 +153,7 @@ fn run(args: Args) -> Result<()> {
                     }
                 };
                 let mut name_value = args.next().unwrap();
-                let name = match name_value.text() {
+                let name = match name_value.to_text() {
                     Ok(s) => s,
                     Err(_) => {
                         ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
@@ -552,7 +552,7 @@ fn regexp_func(mut ctx: Context, args: &mut dyn ExactSizeIterator<Item = Protect
     if text.is_null() {
         return;
     }
-    let text = text.text().to_string_lossy();
+    let text = text.to_text().to_string_lossy();
 
     let re = match ctx
         .get_auxdata(0)
@@ -560,7 +560,7 @@ fn regexp_func(mut ctx: Context, args: &mut dyn ExactSizeIterator<Item = Protect
     {
         Some(re) => re,
         None => {
-            let pattern = match pattern_value.text() {
+            let pattern = match pattern_value.to_text() {
                 Ok(pattern) => pattern,
                 Err(err) => {
                     ctx.result_error(ResultCode::ERROR, &err.to_string());

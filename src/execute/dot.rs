@@ -98,7 +98,7 @@ pub(super) fn process_dot_command<'a>(
         }
         "databases" => {
             let databases = {
-                let (mut stmt, _) = match conn.as_ref().prepare("PRAGMA database_list") {
+                let (mut stmt, _) = match conn.prepare("PRAGMA database_list") {
                     Ok(Some(x)) => x,
                     Ok(_) => unreachable!("Statement not empty"),
                     Err(mut err) => {
@@ -128,11 +128,9 @@ pub(super) fn process_dot_command<'a>(
                 debug!(schema = schema, file = file, "Returning database data");
                 let c_schema = cstring_until_first_nul(schema);
                 let rdonly = conn
-                    .as_ref()
                     .db_readonly(&c_schema)
                     .expect("database returned from list is now absent");
                 let txn = conn
-                    .as_ref()
                     .txn_state(Some(&c_schema))
                     .expect("database returned from list is now absent");
                 let _ = writeln!(
@@ -152,13 +150,13 @@ pub(super) fn process_dot_command<'a>(
         }
         "parameter" => match line.args.get(0).map(AsRef::as_ref) {
             Some("clear") if line.args.len() == 1 => {
-                if let Err(mut err) = parameter::clear(conn.as_ref()) {
+                if let Err(mut err) = parameter::clear(conn) {
                     err.clear_error_offset();
                     return Err((position, err));
                 }
             }
             Some("list") if line.args.len() == 1 => {
-                if let Err(mut err) = parameter::list(result, conn.as_ref()) {
+                if let Err(mut err) = parameter::list(result, conn) {
                     err.clear_error_offset();
                     return Err((position, err));
                 }
@@ -176,7 +174,7 @@ pub(super) fn process_dot_command<'a>(
                 }
             }
             Some("unset") if line.args.len() == 2 => {
-                if let Err(mut err) = parameter::unset(conn.as_ref(), &line.args[1]) {
+                if let Err(mut err) = parameter::unset(conn, &line.args[1]) {
                     err.clear_error_offset();
                     return Err((position, err));
                 }

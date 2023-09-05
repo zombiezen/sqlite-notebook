@@ -1,5 +1,8 @@
+use std::borrow::Borrow;
 use std::ffi::c_int;
 use std::marker::PhantomData;
+use std::mem;
+use std::ops::Deref;
 use std::ptr::NonNull;
 use std::slice;
 use std::str;
@@ -10,32 +13,6 @@ use libsqlite3_sys::{
 };
 
 use crate::*;
-
-/// A reference to a SQLite value.
-#[derive(Clone, Copy, Debug)]
-pub struct UnprotectedValue<'a> {
-    ptr: NonNull<sqlite3_value>,
-    phantom_ref: PhantomData<&'a sqlite3_value>,
-}
-
-impl<'a> UnprotectedValue<'a> {
-    #[inline]
-    pub(crate) unsafe fn new(ptr: NonNull<sqlite3_value>) -> Self {
-        UnprotectedValue {
-            ptr,
-            phantom_ref: PhantomData,
-        }
-    }
-}
-
-impl<'a> Value for UnprotectedValue<'a> {
-    fn as_ptr(&self) -> *mut sqlite3_value {
-        self.ptr.as_ptr()
-    }
-}
-
-unsafe impl<'a> Send for UnprotectedValue<'a> {}
-unsafe impl<'a> Sync for UnprotectedValue<'a> {}
 
 /// A mutex-protected reference to a SQLite value.
 #[repr(transparent)]
@@ -60,12 +37,17 @@ impl<'a> ProtectedValue<'a> {
         (unsafe { sqlite3_value_type(self.as_ptr()) }) == SQLITE_NULL
     }
 
-    /// Returns the type of the value.
-    pub fn r#type(&self) -> ColumnType {
-        ColumnType::from_int(unsafe { sqlite3_value_type(self.ptr.as_ptr()) }).unwrap()
+    /// Returns the datatype of the value.
+    /// The return value is undefined after calling any of
+    /// [`to_i64`], [`to_f64`], [`to_text`], or [`to_blob`]
+    /// on the column, as these can all perform conversions.
+    pub fn r#type(&self) -> DataType {
+        DataType::from_int(unsafe { sqlite3_value_type(self.ptr.as_ptr()) }).unwrap()
     }
 
-    pub fn text<'b>(&'b mut self) -> Result<&'b str, ColumnTextError<'b>> {
+    /// Returns the value as `TEXT` (a UTF-8 string),
+    /// converting it if necessary.
+    pub fn to_text<'b>(&'b mut self) -> Result<&'b str, TextError<'b>> {
         let bytes = unsafe {
             let ptr = sqlite3_value_text(self.ptr.as_ptr());
             if ptr.is_null() {
@@ -74,7 +56,7 @@ impl<'a> ProtectedValue<'a> {
             let n = sqlite3_value_bytes(self.ptr.as_ptr());
             slice::from_raw_parts(ptr, n as usize)
         };
-        str::from_utf8(bytes).map_err(|err| ColumnTextError::new(bytes, err))
+        str::from_utf8(bytes).map_err(|err| TextError::new(bytes, err))
     }
 }
 
@@ -92,7 +74,7 @@ pub struct DupValue {
 }
 
 impl DupValue {
-    /// Borrows the value as a protected value.
+    /// Mutably borrows the value as a protected value.
     #[inline]
     pub fn as_mut<'a>(&'a mut self) -> ProtectedValue<'a> {
         unsafe { ProtectedValue::new(self.ptr) }
@@ -111,11 +93,60 @@ impl Clone for DupValue {
     }
 }
 
+impl AsRef<ProtectedValue<'static>> for DupValue {
+    fn as_ref(&self) -> &ProtectedValue<'static> {
+        // Safe because we know that a ProtectedValue
+        // has the same layout as a NonNull<sqlite3_value>.
+        unsafe { mem::transmute(&self.ptr) }
+    }
+}
+
+impl Borrow<ProtectedValue<'static>> for DupValue {
+    fn borrow(&self) -> &ProtectedValue<'static> {
+        self.as_ref()
+    }
+}
+
+impl Deref for DupValue {
+    type Target = ProtectedValue<'static>;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
 impl Drop for DupValue {
     fn drop(&mut self) {
         unsafe { sqlite3_value_free(self.ptr.as_ptr()) }
     }
 }
+
+/// A reference to a SQLite value.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+pub struct UnprotectedValue<'a> {
+    ptr: NonNull<sqlite3_value>,
+    phantom_ref: PhantomData<&'a sqlite3_value>,
+}
+
+impl<'a> UnprotectedValue<'a> {
+    #[inline]
+    pub(crate) unsafe fn new(ptr: NonNull<sqlite3_value>) -> Self {
+        UnprotectedValue {
+            ptr,
+            phantom_ref: PhantomData,
+        }
+    }
+}
+
+impl<'a> Value for UnprotectedValue<'a> {
+    fn as_ptr(&self) -> *mut sqlite3_value {
+        self.ptr.as_ptr()
+    }
+}
+
+unsafe impl<'a> Send for UnprotectedValue<'a> {}
+unsafe impl<'a> Sync for UnprotectedValue<'a> {}
 
 /// Trait that is one of [`UnprotectedValue`], [`ProtectedValue`], or [`DupValue`].
 /// This trait is sealed and cannot be implemented for types outside this crate.
@@ -142,7 +173,7 @@ mod private {
 /// Enumeration of the SQLite fundamental datatypes.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ColumnType {
+pub enum DataType {
     /// 64-bit signed integer.
     Integer = SQLITE_INTEGER as u8,
     /// 64-bit IEEE floating point number.
@@ -155,14 +186,14 @@ pub enum ColumnType {
     Null = SQLITE_NULL as u8,
 }
 
-impl ColumnType {
-    pub(crate) fn from_int(i: c_int) -> Option<ColumnType> {
+impl DataType {
+    pub(crate) fn from_int(i: c_int) -> Option<DataType> {
         match i {
-            SQLITE_INTEGER => Some(ColumnType::Integer),
-            SQLITE_FLOAT => Some(ColumnType::Float),
-            SQLITE_TEXT => Some(ColumnType::Text),
-            SQLITE_BLOB => Some(ColumnType::Blob),
-            SQLITE_NULL => Some(ColumnType::Null),
+            SQLITE_INTEGER => Some(DataType::Integer),
+            SQLITE_FLOAT => Some(DataType::Float),
+            SQLITE_TEXT => Some(DataType::Text),
+            SQLITE_BLOB => Some(DataType::Blob),
+            SQLITE_NULL => Some(DataType::Null),
             _ => None,
         }
     }
@@ -170,12 +201,13 @@ impl ColumnType {
     /// Reports whether the column type is equal to [`ColumnType::Null`].
     #[inline]
     pub fn is_null(self) -> bool {
-        self == ColumnType::Null
+        self == DataType::Null
     }
 }
 
-impl Default for ColumnType {
+impl Default for DataType {
+    /// Returns [`DataType::Null`].
     fn default() -> Self {
-        ColumnType::Null
+        DataType::Null
     }
 }

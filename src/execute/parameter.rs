@@ -10,7 +10,10 @@ use zombiezen_sqlite::{ConfigFlag, Conn, Connection, ResultExt, Statement, StepR
 use super::{EscapeHtml, SQLiteOutputBuilder};
 
 /// Bind parameters from values in the `temp.sqlite_parameters` table.
-pub(super) fn bind_prepared_stmt(conn: Conn, stmt: &mut Statement) -> zombiezen_sqlite::Result<()> {
+pub(super) fn bind_prepared_stmt(
+    conn: &Conn,
+    stmt: &mut Statement,
+) -> zombiezen_sqlite::Result<()> {
     let n = stmt.bind_parameter_count();
     let span = debug_span!("parameter::bind_prepared_stmt", n = n);
     let _enter = span.enter();
@@ -70,12 +73,12 @@ pub(super) fn init(conn: &mut Connection) -> zombiezen_sqlite::Result<()> {
     let span = debug_span!("parameter::init");
     let _enter = span.enter();
 
-    let defensive_mode = conn.as_ref().get_config(ConfigFlag::Defensive)?;
-    let writable_schema = conn.as_ref().get_config(ConfigFlag::WritableSchema)?;
+    let defensive_mode = conn.get_config(ConfigFlag::Defensive)?;
+    let writable_schema = conn.get_config(ConfigFlag::WritableSchema)?;
 
     conn.config(ConfigFlag::Defensive, false)?;
     conn.config(ConfigFlag::WritableSchema, true)?;
-    let mut stmt_result = conn.as_ref().prepare(include_str!("parameters.sql"));
+    let mut stmt_result = conn.prepare(include_str!("parameters.sql"));
     match stmt_result {
         Ok(Some((ref mut stmt, _))) => {
             loop {
@@ -111,7 +114,7 @@ pub(super) fn init(conn: &mut Connection) -> zombiezen_sqlite::Result<()> {
 pub(super) fn set(conn: &mut Connection, key: &str, value: &str) -> zombiezen_sqlite::Result<()> {
     init(conn)?;
     debug!(key = key, value = value, "Setting parameter...");
-    let mut stmt = match conn.as_ref().prepare(&format!(
+    let mut stmt = match conn.prepare(&format!(
         "REPLACE INTO temp.sqlite_parameters(key,value) \
          VALUES (?1, {value});"
     )) {
@@ -122,7 +125,6 @@ pub(super) fn set(conn: &mut Connection, key: &str, value: &str) -> zombiezen_sq
             // Fallback to text.
             debug!(value = value, "Falling back to text for parameter value");
             let mut stmt = conn
-                .as_ref()
                 .prepare("REPLACE INTO temp.sqlite_parameters(key,value) VALUES (?1, ?2);")?
                 .unwrap()
                 .0;
@@ -136,7 +138,7 @@ pub(super) fn set(conn: &mut Connection, key: &str, value: &str) -> zombiezen_sq
     Ok(())
 }
 
-pub(super) fn unset(conn: Conn, key: &str) -> zombiezen_sqlite::Result<()> {
+pub(super) fn unset(conn: &Conn, key: &str) -> zombiezen_sqlite::Result<()> {
     let Ok(Some((mut stmt, _))) = conn.prepare("DELETE FROM temp.sqlite_parameters WHERE key = ?") else {
         // Table may not exist. Ignore error.
         return Ok(());
@@ -146,7 +148,7 @@ pub(super) fn unset(conn: Conn, key: &str) -> zombiezen_sqlite::Result<()> {
     Ok(())
 }
 
-pub(super) fn clear(conn: Conn) -> zombiezen_sqlite::Result<()> {
+pub(super) fn clear(conn: &Conn) -> zombiezen_sqlite::Result<()> {
     let mut stmt = match conn.prepare("DROP TABLE IF EXISTS temp.sqlite_parameters;") {
         Ok(Some((stmt, _))) => stmt,
         Ok(None) => unreachable!("Statement not empty"),
@@ -169,7 +171,7 @@ pub(super) fn clear(conn: Conn) -> zombiezen_sqlite::Result<()> {
     Ok(())
 }
 
-pub(super) fn list(result: &mut SQLiteOutputBuilder, conn: Conn) -> zombiezen_sqlite::Result<()> {
+pub(super) fn list(result: &mut SQLiteOutputBuilder, conn: &Conn) -> zombiezen_sqlite::Result<()> {
     let column_width = match conn.prepare("SELECT max(length(key)) FROM temp.sqlite_parameters;") {
         Ok(Some((mut stmt, _))) => match stmt.step() {
             Ok(StepResult::Row) => stmt.column_i64(0).clamp(0, 40) as usize,

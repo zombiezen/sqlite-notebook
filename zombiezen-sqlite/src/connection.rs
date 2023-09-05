@@ -1,30 +1,29 @@
+use std::borrow::Borrow;
 use std::ffi::{c_char, c_int, CStr};
 use std::fmt::Debug;
-use std::marker::PhantomData;
-use std::mem::MaybeUninit;
+use std::mem::{self, MaybeUninit};
+use std::ops::Deref;
 use std::ptr::{self, NonNull};
 
 use bitflags::bitflags;
 use libsqlite3_sys::{
-    sqlite3, sqlite3_close, sqlite3_db_readonly, sqlite3_open_v2, sqlite3_prepare_v2,
-    sqlite3_txn_state, SQLITE_OPEN_CREATE, SQLITE_OPEN_FULLMUTEX, SQLITE_OPEN_MEMORY,
-    SQLITE_OPEN_NOMUTEX, SQLITE_OPEN_READONLY, SQLITE_OPEN_READWRITE, SQLITE_OPEN_SHAREDCACHE,
-    SQLITE_OPEN_URI, SQLITE_TXN_NONE, SQLITE_TXN_READ, SQLITE_TXN_WRITE,
-};
-use libsqlite3_sys::{
-    sqlite3_db_config, SQLITE_DBCONFIG_DEFENSIVE, SQLITE_DBCONFIG_DQS_DDL, SQLITE_DBCONFIG_DQS_DML,
-    SQLITE_DBCONFIG_ENABLE_FKEY, SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER,
+    sqlite3, sqlite3_close, sqlite3_db_config, sqlite3_db_readonly, sqlite3_open_v2,
+    sqlite3_prepare_v2, sqlite3_txn_state, SQLITE_DBCONFIG_DEFENSIVE, SQLITE_DBCONFIG_DQS_DDL,
+    SQLITE_DBCONFIG_DQS_DML, SQLITE_DBCONFIG_ENABLE_FKEY, SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER,
     SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, SQLITE_DBCONFIG_ENABLE_QPSG,
     SQLITE_DBCONFIG_ENABLE_TRIGGER, SQLITE_DBCONFIG_ENABLE_VIEW,
     SQLITE_DBCONFIG_LEGACY_ALTER_TABLE, SQLITE_DBCONFIG_LEGACY_FILE_FORMAT,
     SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, SQLITE_DBCONFIG_RESET_DATABASE,
     SQLITE_DBCONFIG_REVERSE_SCANORDER, SQLITE_DBCONFIG_STMT_SCANSTATUS,
     SQLITE_DBCONFIG_TRIGGER_EQP, SQLITE_DBCONFIG_TRUSTED_SCHEMA, SQLITE_DBCONFIG_WRITABLE_SCHEMA,
+    SQLITE_OPEN_CREATE, SQLITE_OPEN_MEMORY, SQLITE_OPEN_NOMUTEX, SQLITE_OPEN_PRIVATECACHE,
+    SQLITE_OPEN_READONLY, SQLITE_OPEN_READWRITE, SQLITE_OPEN_URI, SQLITE_TXN_NONE, SQLITE_TXN_READ,
+    SQLITE_TXN_WRITE,
 };
 
 use crate::*;
 
-/// An owned connection.
+/// An owned connection to a SQLite database.
 #[repr(transparent)]
 #[derive(Debug)]
 pub struct Connection {
@@ -37,13 +36,14 @@ impl Connection {
         self.ptr.as_ptr()
     }
 
+    /// Open a SQLite database as specified by the `filename` argument.
     pub fn open(filename: impl AsRef<CStr>, flags: OpenFlags) -> Result<Connection> {
         let mut db = MaybeUninit::uninit();
         let rc = ResultCode(unsafe {
             sqlite3_open_v2(
                 filename.as_ref().as_ptr(),
                 db.as_mut_ptr(),
-                flags.bits() as c_int,
+                (flags.bits() as c_int) | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_PRIVATECACHE,
                 ptr::null(),
             )
         });
@@ -60,16 +60,6 @@ impl Connection {
         Ok(conn)
     }
 
-    #[inline(always)]
-    pub fn as_ref<'c>(&'c self) -> Conn<'c> {
-        unsafe { Conn::new(self.ptr) }
-    }
-
-    #[inline]
-    pub fn prepare<'c, 's>(&'c self, sql: &'s str) -> Result<Option<(Statement<'c>, &'s str)>> {
-        self.as_ref().prepare(sql)
-    }
-
     /// Sets a database configuration flag.
     pub fn config(&mut self, flag: ConfigFlag, value: bool) -> Result<()> {
         let rc = ResultCode(unsafe {
@@ -84,6 +74,31 @@ impl Connection {
     }
 }
 
+/// Connections can be used by a single thread at a time,
+/// but can be sent to other threads.
+unsafe impl Send for Connection {}
+
+impl AsRef<Conn> for Connection {
+    fn as_ref(&self) -> &Conn {
+        // Safe because we know that a Conn has the same layout as a NonNull<sqlite3>.
+        unsafe { mem::transmute(&self.ptr) }
+    }
+}
+
+impl Deref for Connection {
+    type Target = Conn;
+
+    fn deref(&self) -> &Conn {
+        self.as_ref()
+    }
+}
+
+impl Borrow<Conn> for Connection {
+    fn borrow(&self) -> &Conn {
+        self.as_ref()
+    }
+}
+
 impl Drop for Connection {
     fn drop(&mut self) {
         unsafe {
@@ -95,54 +110,29 @@ impl Drop for Connection {
     }
 }
 
-bitflags! {
-    #[repr(transparent)]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct OpenFlags: c_int {
-        const READONLY = SQLITE_OPEN_READONLY;
-        const READWRITE = SQLITE_OPEN_READWRITE;
-        const CREATE = SQLITE_OPEN_CREATE;
-        const URI = SQLITE_OPEN_URI;
-        const MEMORY = SQLITE_OPEN_MEMORY;
-        const NOMUTEX = SQLITE_OPEN_NOMUTEX;
-        const FULLMUTEX = SQLITE_OPEN_FULLMUTEX;
-        const SHAREDCACHE = SQLITE_OPEN_SHAREDCACHE;
-    }
-}
-
-impl Default for OpenFlags {
-    fn default() -> Self {
-        OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::URI | OpenFlags::NOMUTEX
-    }
-}
-
 /// A reference to a [`Connection`].
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug)]
-pub struct Conn<'c> {
+#[derive(Debug)]
+pub struct Conn {
     db: NonNull<sqlite3>,
-    phantom: PhantomData<&'c sqlite3>,
 }
 
-impl<'c> Conn<'c> {
+impl Conn {
     #[inline(always)]
     pub(crate) unsafe fn new(db: NonNull<sqlite3>) -> Self {
-        Conn {
-            db,
-            phantom: PhantomData,
-        }
+        Conn { db }
     }
 
-    pub(crate) fn error(self) -> Option<Error> {
+    pub(crate) fn error(&self) -> Option<Error> {
         Error::get(self.db)
     }
 
     #[inline]
-    pub(crate) fn as_ptr(self) -> *mut sqlite3 {
+    pub(crate) fn as_ptr(&self) -> *mut sqlite3 {
         self.db.as_ptr()
     }
 
-    pub fn prepare<'s>(self, sql: &'s str) -> Result<Option<(Statement<'c>, &'s str)>> {
+    pub fn prepare<'c, 's>(&'c self, sql: &'s str) -> Result<Option<(Statement<'c>, &'s str)>> {
         let n_byte: c_int = sql
             .len()
             .try_into()
@@ -174,7 +164,7 @@ impl<'c> Conn<'c> {
 
     /// Reports whether the given schema is attached as read-only.
     /// Returns `None` if the argument does not name a database on the connection.
-    pub fn db_readonly(self, schema: &(impl AsRef<CStr> + ?Sized)) -> Option<bool> {
+    pub fn db_readonly(&self, schema: &(impl AsRef<CStr> + ?Sized)) -> Option<bool> {
         let result = unsafe { sqlite3_db_readonly(self.as_ptr(), schema.as_ref().as_ptr()) };
         match result {
             -1 => None,
@@ -187,7 +177,7 @@ impl<'c> Conn<'c> {
     /// Returns the current transaction state of the given schema.
     /// If no schema is given, then the highest transaction state of any schema is returned.
     pub fn txn_state(
-        self,
+        &self,
         schema: Option<&(impl AsRef<CStr> + ?Sized)>,
     ) -> Option<TransactionState> {
         let schema_ptr = schema
@@ -204,7 +194,7 @@ impl<'c> Conn<'c> {
     }
 
     /// Returns the current value of the given database configuration flag.
-    pub fn get_config(self, flag: ConfigFlag) -> Result<bool> {
+    pub fn get_config(&self, flag: ConfigFlag) -> Result<bool> {
         unsafe {
             let mut val = MaybeUninit::<c_int>::uninit();
             let rc = ResultCode(sqlite3_db_config(
@@ -215,6 +205,36 @@ impl<'c> Conn<'c> {
             ));
             rc.to_result().map(|_| val.assume_init() != 0)
         }
+    }
+}
+
+bitflags! {
+    /// Options for [`Connection::open`].
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct OpenFlags: c_int {
+        /// The database is opened in read-only mode.
+        /// If the database does not already exist, an error is returned.
+        const READONLY = SQLITE_OPEN_READONLY;
+        /// The database is opened for reading and writing if possible,
+        /// or reading only if the file is write protected by the operating system.
+        /// In either case the database must already exist, otherwise an error is returned.
+        const READWRITE = SQLITE_OPEN_READWRITE;
+        /// The database is opened for reading and writing,
+        /// and is created if it does not already exist.
+        /// Must be combined with [`OpenFlags::READWRITE`].
+        const CREATE = SQLITE_OPEN_CREATE;
+        /// The filename can be interpreted as a URI if this flag is set.
+        const URI = SQLITE_OPEN_URI;
+        /// The database will be opened as an in-memory database.
+        /// The `filename` argument is ignored.
+        const MEMORY = SQLITE_OPEN_MEMORY;
+    }
+}
+
+impl Default for OpenFlags {
+    fn default() -> Self {
+        OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::URI
     }
 }
 
