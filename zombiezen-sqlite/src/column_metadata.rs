@@ -7,7 +7,7 @@ use libsqlite3_sys::sqlite3_table_column_metadata;
 
 use crate::{Conn, Result, ResultCode};
 
-impl Conn {
+impl<'c> Conn<'c> {
     /// Return information about the given column of the given table.
     /// `schema` is the name of the database
     /// (i.e. "main", "temp", or an attached database)
@@ -15,7 +15,7 @@ impl Conn {
     /// using the same algorithm used by the database engine
     /// to resolve unqualified table references.
     pub fn table_column_metadata(
-        &self,
+        self,
         schema: Option<&(impl AsRef<CStr> + ?Sized)>,
         table_name: &(impl AsRef<CStr> + ?Sized),
         column_name: &(impl AsRef<CStr> + ?Sized),

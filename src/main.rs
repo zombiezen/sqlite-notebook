@@ -3,7 +3,6 @@ use std::fmt;
 use std::fs;
 use std::iter;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::process::exit;
 use std::rc::Rc;
 
@@ -19,14 +18,9 @@ use tracing::{debug, debug_span, error, field, info, trace_span, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Builder as UuidBuilder;
 use zombiezen_const_cstr::const_cstr;
-use zombiezen_sqlite::stricmp;
-use zombiezen_sqlite::Context;
-use zombiezen_sqlite::FunctionFlags;
-use zombiezen_sqlite::Protected;
-use zombiezen_sqlite::ResultCode;
-use zombiezen_sqlite::ResultExt;
-use zombiezen_sqlite::Value;
-use zombiezen_sqlite::{Connection, OpenFlags};
+use zombiezen_sqlite::{
+    stricmp, Connection, Context, FunctionFlags, OpenFlags, ProtectedValue, ResultCode, ResultExt,
+};
 use zombiezen_zmq::{
     Context as ZeroMQContext, Errno, Events, PollItem, RecvFlags, SendFlags, Socket,
 };
@@ -130,7 +124,7 @@ fn run(args: Args) -> Result<()> {
         let dir = TempDir::new("sqlite-notebook")?;
         let db_path = dir.path().join("database.sqlite");
         span.record("path", db_path.to_string_lossy().as_ref());
-        let conn = Connection::open(cstr_from_osstr(&db_path), OpenFlags::default())?;
+        let mut conn = Connection::open(cstr_from_osstr(&db_path), OpenFlags::default())?;
         conn.create_scalar_function(
             const_cstr!("regexp").as_cstr(),
             Some(2),
@@ -141,23 +135,25 @@ fn run(args: Args) -> Result<()> {
             const_cstr!("shell_add_schema").as_cstr(),
             Some(3),
             FunctionFlags::empty(),
-            |ctx, args| {
+            |mut ctx, args| {
                 let mut input_value = args.next().unwrap();
-                let input = match input_value.as_mut().text() {
+                let input = match input_value.text() {
                     Ok(s) => s,
                     Err(_) => {
                         ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
                         return;
                     }
                 };
-                let schema = match args.next().unwrap().text() {
+                let mut schema_value = args.next().unwrap();
+                let schema = match schema_value.text() {
                     Ok(s) => s,
                     Err(_) => {
                         ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
                         return;
                     }
                 };
-                let name = match args.next().unwrap().text() {
+                let mut name_value = args.next().unwrap();
+                let name = match name_value.text() {
                     Ok(s) => s,
                     Err(_) => {
                         ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
@@ -550,19 +546,15 @@ fn shell_add_schema_name(input: &str, schema: &str, _name: &str) -> Option<Strin
     None
 }
 
-fn regexp_func(
-    mut ctx: Pin<&mut Context>,
-    args: &mut dyn ExactSizeIterator<Item = Pin<&mut Value<Protected>>>,
-) {
-    let pattern_value = args.next().unwrap();
-    let text = args.next().unwrap();
+fn regexp_func(mut ctx: Context, args: &mut dyn ExactSizeIterator<Item = ProtectedValue>) {
+    let mut pattern_value = args.next().unwrap();
+    let mut text = args.next().unwrap();
     if text.is_null() {
         return;
     }
     let text = text.text().to_string_lossy();
 
     let re = match ctx
-        .as_mut()
         .get_auxdata(0)
         .and_then(|data| data.downcast_ref::<Rc<RE2>>().cloned())
     {
@@ -578,7 +570,7 @@ fn regexp_func(
             match RE2::new(pattern) {
                 Ok(re) => {
                     let re = Rc::new(re);
-                    ctx.as_mut().set_auxdata(0, Box::new(re.clone()));
+                    ctx.set_auxdata(0, Box::new(re.clone()));
                     re
                 }
                 Err(err) => {

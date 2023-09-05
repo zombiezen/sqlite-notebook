@@ -1,13 +1,10 @@
-use std::borrow::{Borrow, Cow};
-use std::cell::Cell;
+use std::borrow::Cow;
 use std::cmp::{min, Ordering};
 use std::ffi::{c_char, c_int, c_uchar, c_uint, CStr};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::ops::Deref;
-use std::ptr::{self, null, NonNull};
-use std::rc::Rc;
+use std::ptr::{self, NonNull};
 use std::str::{self, Utf8Error};
 use std::{fmt, slice};
 
@@ -41,31 +38,25 @@ use libsqlite3_sys::{
     SQLITE_UTF8,
 };
 
-type PhantomUnsend = PhantomData<Rc<()>>;
-type PhantomUnsync = PhantomData<Cell<()>>;
-
+/// A reference to a [`Connection`].
 #[repr(transparent)]
-pub struct Conn {
-    db: sqlite3,
-    unsync: PhantomUnsync,
+#[derive(Clone, Copy, Debug)]
+pub struct Conn<'c> {
+    db: NonNull<sqlite3>,
+    phantom: PhantomData<&'c sqlite3>,
 }
 
-impl Conn {
-    fn error(&self) -> Option<Error> {
-        Error::get(self.as_nonnull())
+impl<'c> Conn<'c> {
+    fn error(self) -> Option<Error> {
+        Error::get(self.db)
     }
 
     #[inline]
-    fn as_nonnull(&self) -> NonNull<sqlite3> {
-        unsafe { NonNull::new_unchecked(self.as_ptr()) }
+    fn as_ptr(self) -> *mut sqlite3 {
+        self.db.as_ptr()
     }
 
-    #[inline]
-    fn as_ptr(&self) -> *mut sqlite3 {
-        ptr::addr_of!(self.db) as *mut sqlite3
-    }
-
-    pub fn prepare<'c, 's>(&'c self, sql: &'s str) -> Result<Option<(Statement<'c>, &'s str)>> {
+    pub fn prepare<'s>(self, sql: &'s str) -> Result<Option<(Statement<'c>, &'s str)>> {
         let n_byte: c_int = sql
             .len()
             .try_into()
@@ -86,7 +77,8 @@ impl Conn {
             debug_assert!(unsafe { stmt.assume_init() }.is_null());
             return Err(self.error().unwrap());
         }
-        Ok(NonNull::new(unsafe { stmt.assume_init() }).map(|ptr| {
+        let ptr = unsafe { stmt.assume_init() };
+        if !ptr.is_null() {
             let n = unsafe { tail.assume_init().offset_from(z_sql) };
             let stmt = Statement {
                 ptr,
@@ -94,13 +86,15 @@ impl Conn {
                 conn: PhantomData,
             };
             let tail = sql.split_at(n as usize).1;
-            (stmt, tail)
-        }))
+            Ok(Some((stmt, tail)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Reports whether the given schema is attached as read-only.
     /// Returns `None` if the argument does not name a database on the connection.
-    pub fn db_readonly(&self, schema: &(impl AsRef<CStr> + ?Sized)) -> Option<bool> {
+    pub fn db_readonly(self, schema: &(impl AsRef<CStr> + ?Sized)) -> Option<bool> {
         let result = unsafe { sqlite3_db_readonly(self.as_ptr(), schema.as_ref().as_ptr()) };
         match result {
             -1 => None,
@@ -111,15 +105,10 @@ impl Conn {
     }
 }
 
-impl Debug for Conn {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Pointer::fmt(&&self.db, f)
-    }
-}
-
+/// An owned connection.
 #[repr(transparent)]
 #[derive(Debug)]
-pub struct Connection(NonNull<Conn>);
+pub struct Connection(NonNull<sqlite3>);
 
 impl Connection {
     pub fn open(filename: impl AsRef<CStr>, flags: OpenFlags) -> Result<Connection> {
@@ -129,34 +118,33 @@ impl Connection {
                 filename.as_ref().as_ptr(),
                 db.as_mut_ptr(),
                 flags.bits() as c_int,
-                null(),
+                ptr::null(),
             )
         });
         let db = match NonNull::new(unsafe { db.assume_init() }) {
-            Some(db) => db.cast::<Conn>(),
+            Some(db) => db,
             None => return Err(ResultCode::NOMEM.to_result().unwrap_err()),
         };
         let mut conn = Connection(db); // Now will drop properly.
         if rc != ResultCode::OK {
-            return Err(conn.error().unwrap());
+            return Err(conn.as_ref().error().unwrap());
         }
         conn.config(ConfigFlag::DoubleQuotedStringDML, false)?;
         conn.config(ConfigFlag::DoubleQuotedStringDDL, false)?;
         Ok(conn)
     }
-}
 
-impl Deref for Connection {
-    type Target = Conn;
-
-    fn deref(&self) -> &Self::Target {
-        self.borrow()
+    #[inline(always)]
+    pub fn as_ref<'c>(&'c self) -> Conn<'c> {
+        Conn {
+            db: self.0,
+            phantom: PhantomData,
+        }
     }
-}
 
-impl Borrow<Conn> for Connection {
-    fn borrow(&self) -> &Conn {
-        unsafe { self.0.as_ref() }
+    #[inline]
+    pub fn prepare<'c, 's>(&'c self, sql: &'s str) -> Result<Option<(Statement<'c>, &'s str)>> {
+        self.as_ref().prepare(sql)
     }
 }
 
@@ -200,14 +188,14 @@ impl Drop for Connection {
 /// ```
 #[derive(Debug)]
 pub struct Statement<'c> {
-    ptr: NonNull<sqlite3_stmt>,
+    ptr: *mut sqlite3_stmt,
     has_row: bool,
     conn: PhantomData<&'c Connection>,
 }
 
 impl<'c> Statement<'c> {
     fn error(&self) -> Option<Error> {
-        let db = NonNull::new(unsafe { sqlite3_db_handle(self.ptr.as_ptr()) });
+        let db = NonNull::new(unsafe { sqlite3_db_handle(self.ptr) });
         db.and_then(|db| Error::get(db))
     }
 
@@ -216,7 +204,7 @@ impl<'c> Statement<'c> {
     /// the statement has finished executing successfully
     /// and `step` should not be called again without first calling [`reset`].
     pub fn step(&mut self) -> Result<StepResult> {
-        let rc = ResultCode(unsafe { sqlite3_step(self.ptr.as_ptr()) });
+        let rc = ResultCode(unsafe { sqlite3_step(self.ptr) });
         match rc {
             ResultCode::ROW => {
                 self.has_row = true;
@@ -242,7 +230,7 @@ impl<'c> Statement<'c> {
     /// This does not change the bindings: use [`clear_bindings`] to do that.
     pub fn reset(&mut self) -> Result<()> {
         self.has_row = false;
-        let rc = ResultCode(unsafe { sqlite3_reset(self.ptr.as_ptr()) });
+        let rc = ResultCode(unsafe { sqlite3_reset(self.ptr) });
         match rc {
             ResultCode::OK => Ok(()),
             _ => Err(self.error().unwrap()),
@@ -252,7 +240,7 @@ impl<'c> Statement<'c> {
     /// Reset all host parameters to `NULL`.
     pub fn clear_bindings(&mut self) {
         unsafe {
-            sqlite3_clear_bindings(self.ptr.as_ptr());
+            sqlite3_clear_bindings(self.ptr);
         }
     }
 
@@ -260,7 +248,7 @@ impl<'c> Statement<'c> {
     /// For all forms except `?NNN`,
     /// this will correspond to the number of unique parameters.
     pub fn bind_parameter_count(&self) -> usize {
-        (unsafe { sqlite3_bind_parameter_count(self.ptr.as_ptr()) }) as usize
+        (unsafe { sqlite3_bind_parameter_count(self.ptr) }) as usize
     }
 
     #[inline(always)]
@@ -276,7 +264,7 @@ impl<'c> Statement<'c> {
     pub fn bind_parameter_name(&self, i: usize) -> Option<&CStr> {
         let i = Self::usize_to_int(i).ok()?;
         unsafe {
-            let ptr = sqlite3_bind_parameter_name(self.ptr.as_ptr(), i);
+            let ptr = sqlite3_bind_parameter_name(self.ptr, i);
             if ptr.is_null() {
                 None
             } else {
@@ -312,7 +300,7 @@ impl<'c> Statement<'c> {
         F: FnOnce(*mut sqlite3_stmt, c_int) -> c_int,
     {
         let i = Self::usize_to_int(i)?;
-        let rc = ResultCode(f(self.ptr.as_ptr(), i));
+        let rc = ResultCode(f(self.ptr, i));
         if rc.is_success() {
             Ok(())
         } else {
@@ -329,9 +317,9 @@ impl<'c> Statement<'c> {
     /// Sets a host parameter in a statement the given value.
     /// The first host parameter has an index of 1.
     /// This function operates on both protected and unprotected values.
-    pub fn bind_value<P: ValueProtection>(&mut self, i: usize, v: &Value<P>) -> Result<()> {
+    pub fn bind_value<V: Value + ?Sized>(&mut self, i: usize, v: &V) -> Result<()> {
         self.bind(i, |stmt, i| unsafe {
-            sqlite3_bind_value(stmt, i, v.as_const_ptr())
+            sqlite3_bind_value(stmt, i, v.as_ptr())
         })
     }
 
@@ -384,7 +372,7 @@ impl<'c> Statement<'c> {
     /// Returns the number of columns in the result set returned by the statement.
     /// If `column_count` returns 0, then the statement returns no data.
     pub fn column_count(&self) -> usize {
-        (unsafe { sqlite3_column_count(self.ptr.as_ptr()) }) as usize
+        (unsafe { sqlite3_column_count(self.ptr) }) as usize
     }
 
     /// Returns the name assigned to a particular column using the "AS" clause.
@@ -401,7 +389,7 @@ impl<'c> Statement<'c> {
         // until the next call to sqlite3_column_name() [...]
         // on the same column."
         unsafe {
-            let s = sqlite3_column_name(self.ptr.as_ptr(), i as c_int);
+            let s = sqlite3_column_name(self.ptr, i as c_int);
             if s.is_null() {
                 return None;
             }
@@ -429,7 +417,7 @@ impl<'c> Statement<'c> {
     /// or if `i >= self.column_count()`.
     pub fn column_type(&self, i: usize) -> ColumnType {
         self.check_col(i);
-        ColumnType::from_int(unsafe { sqlite3_column_type(self.ptr.as_ptr(), i as c_int) })
+        ColumnType::from_int(unsafe { sqlite3_column_type(self.ptr, i as c_int) })
             .expect("SQLite returned an unknown column type")
     }
 
@@ -445,7 +433,7 @@ impl<'c> Statement<'c> {
     /// or if `i >= self.column_count()`.
     pub fn column_i64(&mut self, i: usize) -> i64 {
         self.check_col(i);
-        unsafe { sqlite3_column_int64(self.ptr.as_ptr(), i as c_int) }
+        unsafe { sqlite3_column_int64(self.ptr, i as c_int) }
     }
 
     /// Returns the value in the `i`th column as 64-bit floating point number,
@@ -460,7 +448,7 @@ impl<'c> Statement<'c> {
     /// or if `i >= self.column_count()`.
     pub fn column_f64(&mut self, i: usize) -> f64 {
         self.check_col(i);
-        unsafe { sqlite3_column_double(self.ptr.as_ptr(), i as c_int) }
+        unsafe { sqlite3_column_double(self.ptr, i as c_int) }
     }
 
     /// Returns the value in the `i`th column as `TEXT` (a UTF-8 string),
@@ -503,11 +491,11 @@ impl<'c> Statement<'c> {
     pub fn column_text(&mut self, i: usize) -> Result<&str, ColumnTextError> {
         self.check_col(i);
         let bytes = unsafe {
-            let ptr = sqlite3_column_text(self.ptr.as_ptr(), i as c_int);
+            let ptr = sqlite3_column_text(self.ptr, i as c_int);
             if ptr.is_null() {
                 return Ok("");
             }
-            let n = sqlite3_column_bytes(self.ptr.as_ptr(), i as c_int);
+            let n = sqlite3_column_bytes(self.ptr, i as c_int);
             slice::from_raw_parts(ptr, n as usize)
         };
         str::from_utf8(bytes).map_err(|err| ColumnTextError { bytes, err })
@@ -526,11 +514,11 @@ impl<'c> Statement<'c> {
     pub fn column_blob(&mut self, i: usize) -> &[u8] {
         self.check_col(i);
         unsafe {
-            let ptr = sqlite3_column_blob(self.ptr.as_ptr(), i as c_int);
+            let ptr = sqlite3_column_blob(self.ptr, i as c_int);
             if ptr.is_null() {
                 return b"";
             }
-            let n = sqlite3_column_bytes(self.ptr.as_ptr(), i as c_int);
+            let n = sqlite3_column_bytes(self.ptr, i as c_int);
             slice::from_raw_parts(ptr as *const u8, n as usize)
         }
     }
@@ -543,13 +531,10 @@ impl<'c> Statement<'c> {
     ///
     /// Panics if the statement has not returned a row
     /// or if `i >= self.column_count()`.
-    pub fn column_value(&self, i: usize) -> &Value<Unprotected> {
+    pub fn column_value<'a>(&'a self, i: usize) -> UnprotectedValue<'a> {
         self.check_col(i);
-        unsafe {
-            let ptr = sqlite3_column_value(self.ptr.as_ptr(), i as c_int);
-            debug_assert!(!ptr.is_null());
-            &*(ptr as *mut Value<Unprotected>)
-        }
+        let ptr = NonNull::new(unsafe { sqlite3_column_value(self.ptr, i as c_int) }).unwrap();
+        UnprotectedValue::new(ptr)
     }
 
     /// Releases any resources associated with the statement
@@ -564,7 +549,8 @@ impl<'c> Statement<'c> {
     }
 
     fn finalize_internal(&mut self) -> Result<()> {
-        if ResultCode(unsafe { sqlite3_finalize(self.ptr.as_ptr()) }).is_success() {
+        if ResultCode(unsafe { sqlite3_finalize(self.ptr) }).is_success() {
+            self.ptr = ptr::null_mut(); // sqlite3_finalize specifically no-ops on NULL.
             Ok(())
         } else {
             Err(self.error().expect("sqlite3_finalize returned an error"))
@@ -800,6 +786,7 @@ mod tests {
     fn test_read_values() {
         let conn = Connection::open(MEMORY, OpenFlags::default()).unwrap();
         let (mut stmt, _) = conn
+            .as_ref()
             .prepare("select 123 as \"int\", 'foo' as \"text\", null as \"null\";")
             .unwrap()
             .expect("statement is not empty");

@@ -10,7 +10,7 @@ use csv::{Writer as CsvWriter, WriterBuilder as CsvWriterBuilder};
 use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::json;
 use tracing::{debug_span, field};
-use zombiezen_sqlite::{ColumnType, Connection, ResultExt, StepResult};
+use zombiezen_sqlite::{ColumnType, Connection, ResultExt, Statement, StepResult};
 use zombiezen_zmq::Socket;
 
 use crate::{reply, wire};
@@ -18,6 +18,7 @@ use crate::{reply, wire};
 use self::position::Position;
 
 mod dot;
+mod parameter;
 mod position;
 
 pub(crate) fn execute<S, K, P>(
@@ -243,6 +244,12 @@ fn run_code<'a>(
                 return Err((position, err));
             }
         };
+        if let Err(err) = parameter::bind_prepared_stmt(conn.as_ref(), &mut stmt) {
+            if let Some(offset) = err.error_offset() {
+                position.advance(code.get(..offset).unwrap_or_default());
+            }
+            return Err((position, err));
+        }
 
         let column_count = stmt.column_count();
         if column_count > 0 {
@@ -274,42 +281,7 @@ fn run_code<'a>(
                 if i > 0 {
                     result.plain.push_str("|");
                 }
-                match stmt.column_type(i) {
-                    ColumnType::Null => result.html.push_str("<td><code>NULL</code></td>"),
-                    ColumnType::Blob => {
-                        let bytes = stmt.column_blob(i);
-                        let hex = hex::encode_upper(bytes);
-                        match std::str::from_utf8(bytes) {
-                            Ok(s) if s.chars().all(|c| !c.is_control()) => {
-                                let _ = write!(
-                                    &mut result.html,
-                                    "<td><code>{}</code></td>",
-                                    EscapeHtml(s)
-                                );
-                                result.plain.push_str(s);
-                            }
-                            _ => {
-                                let _ = write!(
-                                    &mut result.html,
-                                    "<td><i>{}-byte <code>BLOB</code></i></td>",
-                                    bytes.len()
-                                );
-                                result.plain.push_str(&hex);
-                            }
-                        }
-
-                        result.csv.write_field(hex.as_bytes()).unwrap();
-                    }
-                    _ => {
-                        let val = stmt.column_text(i).to_string_lossy();
-
-                        let _ = write!(&mut result.html, "<td>{}</td>", EscapeHtml(&val));
-
-                        result.plain.push_str(&val);
-
-                        result.csv.write_field(val.as_bytes()).unwrap();
-                    }
-                }
+                show_cell(result, &mut stmt, i);
             }
             result.html.push_str("</tr>\n");
             result.plain.push_str("\n");
@@ -322,6 +294,44 @@ fn run_code<'a>(
         code = tail;
     }
     Ok(())
+}
+
+fn show_cell(result: &mut SQLiteOutputBuilder, stmt: &mut Statement, i: usize) {
+    match stmt.column_type(i) {
+        ColumnType::Null => {
+            result.html.push_str("<td><code>NULL</code></td>");
+            result.csv.write_field(b"").unwrap();
+        }
+        ColumnType::Blob => {
+            let bytes = stmt.column_blob(i);
+            let hex = hex::encode_upper(bytes);
+            match std::str::from_utf8(bytes) {
+                Ok(s) if s.chars().all(|c| !c.is_control()) => {
+                    let _ = write!(&mut result.html, "<td><code>{}</code></td>", EscapeHtml(s));
+                    result.plain.push_str(s);
+                }
+                _ => {
+                    let _ = write!(
+                        &mut result.html,
+                        "<td><i>{}-byte <code>BLOB</code></i></td>",
+                        bytes.len()
+                    );
+                    result.plain.push_str(&hex);
+                }
+            }
+
+            result.csv.write_field(hex.as_bytes()).unwrap();
+        }
+        _ => {
+            let val = stmt.column_text(i).to_string_lossy();
+
+            let _ = write!(&mut result.html, "<td>{}</td>", EscapeHtml(&val));
+
+            result.plain.push_str(&val);
+
+            result.csv.write_field(val.as_bytes()).unwrap();
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

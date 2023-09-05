@@ -13,9 +13,9 @@ use libsqlite3_sys::{
 
 use crate::{Conn, Connection, Result, ResultCode};
 
-impl Conn {
+impl<'c> Conn<'c> {
     /// Returns the current value of the given database configuration flag.
-    pub fn get_config(&self, flag: ConfigFlag) -> Result<bool> {
+    pub fn get_config(self, flag: ConfigFlag) -> Result<bool> {
         unsafe {
             let mut val = MaybeUninit::<c_int>::uninit();
             let rc = ResultCode(sqlite3_db_config(
@@ -34,7 +34,7 @@ impl Connection {
     pub fn config(&mut self, flag: ConfigFlag, value: bool) -> Result<()> {
         let rc = ResultCode(unsafe {
             sqlite3_db_config(
-                self.as_ptr(),
+                self.0.as_ptr(),
                 flag as c_int,
                 value as c_int,
                 std::ptr::null_mut::<c_int>(),

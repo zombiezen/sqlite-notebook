@@ -4,11 +4,11 @@ use libsqlite3_sys::{sqlite3_txn_state, SQLITE_TXN_NONE, SQLITE_TXN_READ, SQLITE
 
 use crate::Conn;
 
-impl Conn {
+impl<'c> Conn<'c> {
     /// Returns the current transaction state of the given schema.
     /// If no schema is given, then the highest transaction state of any schema is returned.
     pub fn txn_state(
-        &self,
+        self,
         schema: Option<&(impl AsRef<CStr> + ?Sized)>,
     ) -> Option<TransactionState> {
         let schema_ptr = schema
