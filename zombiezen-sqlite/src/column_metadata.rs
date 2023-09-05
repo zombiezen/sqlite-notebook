@@ -5,7 +5,7 @@ use std::ptr;
 use bitflags::bitflags;
 use libsqlite3_sys::sqlite3_table_column_metadata;
 
-use crate::{Conn, Result, ResultCode};
+use crate::*;
 
 impl<'c> Conn<'c> {
     /// Return information about the given column of the given table.

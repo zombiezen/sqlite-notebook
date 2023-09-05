@@ -6,17 +6,16 @@ use std::ptr::{self, NonNull};
 use std::slice;
 use std::str;
 
-use crate::{bytearray, ColumnTextError, ColumnType, Conn, Connection, Result, ResultCode};
-
 use bitflags::bitflags;
 use libsqlite3_sys::{
     sqlite3_context, sqlite3_context_db_handle, sqlite3_create_function_v2, sqlite3_free,
     sqlite3_get_auxdata, sqlite3_malloc, sqlite3_result_error, sqlite3_result_error_code,
     sqlite3_result_error_toobig, sqlite3_result_int64, sqlite3_result_text64, sqlite3_result_value,
-    sqlite3_set_auxdata, sqlite3_user_data, sqlite3_value, sqlite3_value_bytes, sqlite3_value_dup,
-    sqlite3_value_free, sqlite3_value_text, sqlite3_value_type, SQLITE_DETERMINISTIC,
-    SQLITE_DIRECTONLY, SQLITE_NULL, SQLITE_UTF8,
+    sqlite3_set_auxdata, sqlite3_user_data, sqlite3_value, SQLITE_DETERMINISTIC, SQLITE_DIRECTONLY,
+    SQLITE_UTF8,
 };
+
+use crate::*;
 
 type ScalarFn = Box<dyn Fn(Context, &mut dyn ExactSizeIterator<Item = ProtectedValue>) + 'static>;
 
@@ -34,7 +33,7 @@ impl Connection {
             let app = sqlite3_malloc(BOX_SIZE) as *mut ScalarFn;
             ptr::write(app, f);
             sqlite3_create_function_v2(
-                self.0.as_ptr(),
+                self.as_ptr(),
                 name.as_ref().as_ptr(),
                 n_arg.map_or(-1, |n| n as c_int),
                 SQLITE_UTF8 | flags.bits(),
@@ -70,10 +69,10 @@ unsafe extern "C" fn scalar_callback(
         }
     };
     let arg_slice = slice::from_raw_parts_mut(argv, argc as usize);
-    let mut arg_iter = arg_slice.iter().copied().map(|ptr| ProtectedValue {
-        ptr: NonNull::new(ptr).unwrap(),
-        phantom_ref: PhantomData,
-    });
+    let mut arg_iter = arg_slice
+        .iter()
+        .copied()
+        .map(|ptr| ProtectedValue::new(NonNull::new(ptr).unwrap()));
     let f = app.as_ref();
     f(ctx, &mut arg_iter);
 }
@@ -104,10 +103,7 @@ impl<'a> Context<'a> {
     }
 
     pub fn db_handle<'b>(&'b self) -> Conn<'b> {
-        Conn {
-            db: NonNull::new(unsafe { sqlite3_context_db_handle(self.as_ptr()) }).unwrap(),
-            phantom: PhantomData,
-        }
+        unsafe { Conn::new(NonNull::new(sqlite3_context_db_handle(self.as_ptr())).unwrap()) }
     }
 
     pub fn result_error(&mut self, code: ResultCode, s: &str) {
@@ -186,128 +182,6 @@ impl<'a> Context<'a> {
 unsafe extern "C" fn destroy_auxdata(ptr: *mut c_void) {
     let b: Box<Box<dyn Any>> = Box::from_raw(ptr as *mut Box<dyn Any>);
     drop(b);
-}
-
-/// A reference to a SQLite value.
-#[derive(Clone, Copy, Debug)]
-pub struct UnprotectedValue<'a> {
-    ptr: NonNull<sqlite3_value>,
-    phantom_ref: PhantomData<&'a sqlite3_value>,
-}
-
-impl<'a> UnprotectedValue<'a> {
-    #[inline]
-    pub(crate) fn new(ptr: NonNull<sqlite3_value>) -> Self {
-        UnprotectedValue {
-            ptr,
-            phantom_ref: PhantomData,
-        }
-    }
-}
-
-impl<'a> Value for UnprotectedValue<'a> {
-    fn as_ptr(&self) -> *mut sqlite3_value {
-        self.ptr.as_ptr()
-    }
-}
-
-unsafe impl<'a> Send for UnprotectedValue<'a> {}
-unsafe impl<'a> Sync for UnprotectedValue<'a> {}
-
-/// A mutex-protected reference to a SQLite value.
-#[repr(transparent)]
-#[derive(Debug)]
-pub struct ProtectedValue<'a> {
-    ptr: NonNull<sqlite3_value>,
-    phantom_ref: PhantomData<&'a mut sqlite3_value>,
-}
-
-impl<'a> ProtectedValue<'a> {
-    /// Reports whether the value represents `NULL`.
-    #[inline]
-    pub fn is_null(&self) -> bool {
-        (unsafe { sqlite3_value_type(self.as_ptr()) }) == SQLITE_NULL
-    }
-
-    /// Returns the type of the value.
-    pub fn r#type(&self) -> ColumnType {
-        ColumnType::from_int(unsafe { sqlite3_value_type(self.ptr.as_ptr()) }).unwrap()
-    }
-
-    pub fn text<'b>(&'b mut self) -> Result<&'b str, ColumnTextError<'b>> {
-        let bytes = unsafe {
-            let ptr = sqlite3_value_text(self.ptr.as_ptr());
-            if ptr.is_null() {
-                return Ok("");
-            }
-            let n = sqlite3_value_bytes(self.ptr.as_ptr());
-            slice::from_raw_parts(ptr, n as usize)
-        };
-        str::from_utf8(bytes).map_err(|err| ColumnTextError { bytes, err })
-    }
-}
-
-impl<'a> Value for ProtectedValue<'a> {
-    fn as_ptr(&self) -> *mut sqlite3_value {
-        self.ptr.as_ptr()
-    }
-}
-
-/// An owned SQLite value.
-#[repr(transparent)]
-#[derive(Debug)]
-pub struct DupValue {
-    ptr: NonNull<sqlite3_value>,
-}
-
-impl DupValue {
-    /// Borrows the value as a protected value.
-    pub fn as_mut<'a>(&'a mut self) -> ProtectedValue<'a> {
-        ProtectedValue {
-            ptr: self.ptr,
-            phantom_ref: PhantomData,
-        }
-    }
-}
-
-impl Value for DupValue {
-    fn as_ptr(&self) -> *mut sqlite3_value {
-        self.ptr.as_ptr()
-    }
-}
-
-impl Clone for DupValue {
-    fn clone(&self) -> Self {
-        self.dup()
-    }
-}
-
-impl Drop for DupValue {
-    fn drop(&mut self) {
-        unsafe { sqlite3_value_free(self.ptr.as_ptr()) }
-    }
-}
-
-/// Trait that is one of [`UnprotectedValue`], [`ProtectedValue`], or [`DupValue`].
-/// This trait is sealed and cannot be implemented for types outside this crate.
-pub trait Value: private::Sealed {
-    /// Make an owned copy of the value.
-    fn dup(&self) -> DupValue {
-        DupValue {
-            ptr: NonNull::new(unsafe { sqlite3_value_dup(self.as_ptr()) }).expect("out of memory"),
-        }
-    }
-
-    #[doc(hidden)]
-    fn as_ptr(&self) -> *mut sqlite3_value;
-}
-
-mod private {
-    pub trait Sealed {}
-
-    impl<'a> Sealed for super::UnprotectedValue<'a> {}
-    impl<'a> Sealed for super::ProtectedValue<'a> {}
-    impl Sealed for super::DupValue {}
 }
 
 bitflags! {
