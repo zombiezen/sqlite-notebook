@@ -31,6 +31,7 @@
             pkgs.cargo
             pkgs.rust-analyzer
             pkgs.rustfmt
+            pkgs.valgrind
 
             (pkgs.python3.withPackages (ps: [
               ps.notebook
