@@ -98,8 +98,8 @@ pub(super) fn process_dot_command<'a>(
         }
         "databases" => {
             let databases = {
-                let (mut stmt, _) = match conn.prepare("PRAGMA database_list") {
-                    Ok(Some(x)) => x,
+                let mut stmt = match conn.prepare("PRAGMA database_list").0 {
+                    Ok(Some(stmt)) => stmt,
                     Ok(_) => unreachable!("Statement not empty"),
                     Err(mut err) => {
                         err.clear_error_offset();
@@ -223,8 +223,8 @@ pub(super) fn process_dot_command<'a>(
 
             let schema_query = {
                 let mut database_list_stmt =
-                    match conn.prepare("SELECT name FROM pragma_database_list") {
-                        Ok(Some((stmt, _))) => stmt,
+                    match conn.prepare("SELECT name FROM pragma_database_list").0 {
+                        Ok(Some(stmt)) => stmt,
                         Ok(None) => unreachable!("Statement not empty"),
                         Err(mut err) => {
                             err.clear_error_offset();
@@ -278,8 +278,8 @@ pub(super) fn process_dot_command<'a>(
             };
             debug!("Schema query: {schema_query}");
 
-            let mut stmt = match conn.prepare(&schema_query) {
-                Ok(Some((stmt, _))) => stmt,
+            let mut stmt = match conn.prepare(&schema_query).0 {
+                Ok(Some(stmt)) => stmt,
                 Ok(None) => unreachable!("Statement not empty"),
                 Err(mut err) => {
                     err.clear_error_offset();

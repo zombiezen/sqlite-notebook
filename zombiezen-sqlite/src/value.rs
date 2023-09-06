@@ -7,6 +7,9 @@ use std::ptr::NonNull;
 use std::slice;
 use std::str;
 
+use libsqlite3_sys::sqlite3_value_blob;
+use libsqlite3_sys::sqlite3_value_double;
+use libsqlite3_sys::sqlite3_value_int64;
 use libsqlite3_sys::{
     sqlite3_value, sqlite3_value_bytes, sqlite3_value_dup, sqlite3_value_free, sqlite3_value_text,
     sqlite3_value_type, SQLITE_BLOB, SQLITE_FLOAT, SQLITE_INTEGER, SQLITE_NULL, SQLITE_TEXT,
@@ -39,14 +42,33 @@ impl<'a> ProtectedValue<'a> {
 
     /// Returns the datatype of the value.
     /// The return value is undefined after calling any of
-    /// [`to_i64`], [`to_f64`], [`to_text`], or [`to_blob`]
+    /// [`to_i64`][ProtectedValue::to_i64],
+    /// [`to_f64`][ProtectedValue::to_f64],
+    /// [`to_text`][ProtectedValue::to_text],
+    /// or [`to_blob`][ProtectedValue::to_blob]
     /// on the column, as these can all perform conversions.
+    #[doc(alias = "sqlite3_value_type")]
     pub fn r#type(&self) -> DataType {
         DataType::from_int(unsafe { sqlite3_value_type(self.ptr.as_ptr()) }).unwrap()
     }
 
+    /// Returns the value as a 64-bit integer,
+    /// converting it if necessary.
+    #[doc(alias = "sqlite3_value_int64")]
+    pub fn to_i64(&mut self) -> i64 {
+        unsafe { sqlite3_value_int64(self.ptr.as_ptr()) }
+    }
+
+    /// Returns the value as a 64-bit floating point number,
+    /// converting it if necessary.
+    #[doc(alias = "sqlite3_value_double")]
+    pub fn to_f64(&mut self) -> f64 {
+        unsafe { sqlite3_value_double(self.ptr.as_ptr()) }
+    }
+
     /// Returns the value as `TEXT` (a UTF-8 string),
     /// converting it if necessary.
+    #[doc(alias = "sqlite3_value_text")]
     pub fn to_text<'b>(&'b mut self) -> Result<&'b str, TextError<'b>> {
         let bytes = unsafe {
             let ptr = sqlite3_value_text(self.ptr.as_ptr());
@@ -57,6 +79,20 @@ impl<'a> ProtectedValue<'a> {
             slice::from_raw_parts(ptr, n as usize)
         };
         str::from_utf8(bytes).map_err(|err| TextError::new(bytes, err))
+    }
+
+    /// Returns the value as a `BLOB`,
+    /// converting it if necessary.
+    #[doc(alias = "sqlite3_value_blob")]
+    pub fn to_blob<'b>(&mut self) -> &'b [u8] {
+        unsafe {
+            let ptr = sqlite3_value_blob(self.ptr.as_ptr());
+            if ptr.is_null() {
+                return b"";
+            }
+            let n = sqlite3_value_bytes(self.ptr.as_ptr());
+            slice::from_raw_parts(ptr.cast::<u8>(), n as usize)
+        }
     }
 }
 
@@ -198,7 +234,7 @@ impl DataType {
         }
     }
 
-    /// Reports whether the column type is equal to [`ColumnType::Null`].
+    /// Reports whether the column type is equal to [`DataType::Null`].
     #[inline]
     pub fn is_null(self) -> bool {
         self == DataType::Null

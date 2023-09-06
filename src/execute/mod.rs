@@ -235,9 +235,9 @@ fn run_code<'a>(
 
         // It's SQL!
         let (mut stmt, tail) = match conn.prepare(code) {
-            Ok(Some(x)) => x,
-            Ok(None) => break,
-            Err(err) => {
+            (Ok(Some(stmt)), tail) => (stmt, tail),
+            (Ok(None), _) => break,
+            (Err(err), _) => {
                 if let Some(offset) = err.error_offset() {
                     position.advance(code.get(..offset).unwrap_or_default());
                 }

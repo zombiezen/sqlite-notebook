@@ -1,7 +1,7 @@
 use std::ffi::{c_char, c_int, c_uchar, CStr};
-use std::fmt;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
 use std::slice;
 use std::str::{self, Utf8Error};
@@ -12,14 +12,68 @@ use libsqlite3_sys::{
     sqlite3_bind_value, sqlite3_bind_zeroblob64, sqlite3_clear_bindings, sqlite3_column_blob,
     sqlite3_column_bytes, sqlite3_column_count, sqlite3_column_double, sqlite3_column_int64,
     sqlite3_column_name, sqlite3_column_text, sqlite3_column_type, sqlite3_column_value,
-    sqlite3_complete, sqlite3_db_handle, sqlite3_finalize, sqlite3_reset, sqlite3_step,
-    sqlite3_stmt, SQLITE_DONE, SQLITE_NOMEM, SQLITE_ROW, SQLITE_UTF8,
+    sqlite3_complete, sqlite3_db_handle, sqlite3_finalize, sqlite3_prepare_v2, sqlite3_reset,
+    sqlite3_step, sqlite3_stmt, SQLITE_DONE, SQLITE_NOMEM, SQLITE_ROW, SQLITE_UTF8,
 };
 
 use crate::*;
 
+impl Conn {
+    /// Compile a SQL statement into a byte-code program.
+    /// The first return value is the compiled statement, if one was found.
+    /// The second return value is the remaining uncompiled source.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use zombiezen_sqlite::{Connection, OpenFlags};
+    /// # use std::ffi::CStr;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let conn = Connection::open(<&CStr>::default(), OpenFlags::default() | OpenFlags::MEMORY)?;
+    /// let stmt = conn.prepare("SELECT 2 + 2;").0?.expect("Statement not empty");
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[doc(alias("sqlite3_prepare", "sqlite3_prepare_v2"))]
+    pub fn prepare<'c, 's>(&'c self, sql: &'s str) -> (Result<Option<Statement<'c>>>, &'s str) {
+        let n_byte: c_int = match sql.len().try_into() {
+            Ok(n) => n,
+            Err(_) => return (Err(ResultCode::TOOBIG.to_result().unwrap_err()), sql),
+        };
+        let mut stmt = MaybeUninit::uninit();
+        let z_sql = sql.as_ptr() as *const c_char;
+        let mut tail = MaybeUninit::uninit();
+        let rc = ResultCode(unsafe {
+            sqlite3_prepare_v2(
+                self.as_ptr(),
+                z_sql,
+                n_byte,
+                stmt.as_mut_ptr(),
+                tail.as_mut_ptr(),
+            )
+        });
+        let tail_start = unsafe {
+            let tail_ptr = tail.assume_init();
+            debug_assert!(!tail_ptr.is_null());
+            tail_ptr.offset_from(z_sql)
+        };
+        debug_assert!(tail_start >= 0);
+        let tail = &sql.split_at(tail_start as usize).1;
+        if rc == ResultCode::OK {
+            (
+                Ok(NonNull::new(unsafe { stmt.assume_init() }).map(|ptr| Statement::new(ptr))),
+                tail,
+            )
+        } else {
+            debug_assert!(unsafe { stmt.assume_init() }.is_null());
+            return (Err(self.error().unwrap()), tail);
+        }
+    }
+}
+
 /// A single SQL statement that has been compiled into binary form
 /// and is ready to be evaluated.
+/// Statements are created with [`Conn::prepare`].
 ///
 /// # Example
 ///
@@ -31,7 +85,7 @@ use crate::*;
 /// #         &CString::new(":memory:")?,
 /// #         OpenFlags::default(),
 /// #     )?;
-/// let (mut stmt, _) = conn.prepare("values (123);")?.unwrap();
+/// let mut stmt = conn.prepare("values (123);").0?.unwrap();
 /// # let mut row_count = 0usize;
 /// while stmt.step()?.has_row() {
 ///     let col_value = stmt.column_i64(0);
@@ -346,7 +400,7 @@ impl<'c> Statement<'c> {
     /// #         &CString::new(":memory:")?,
     /// #         OpenFlags::default(),
     /// #     )?;
-    /// #     let (mut stmt, _) = conn.prepare("values ('Hello, World!');")?.unwrap();
+    /// #     let mut stmt = conn.prepare("values ('Hello, World!');").0?.unwrap();
     /// #     assert_eq!(stmt.step()?, StepResult::Row);
     /// let s: Cow<str> = stmt.column_text(0).to_string_lossy();
     /// #     assert_eq!(s, "Hello, World!");
@@ -517,6 +571,8 @@ impl From<StepResult> for ResultCode {
     }
 }
 
+/// Reports if the input string appears to be a complete SQL statement.
+#[doc(alias = "sqlite3_complete")]
 pub fn is_complete(s: impl AsRef<CStr>) -> bool {
     let s = s.as_ref().as_ptr();
     let rc = unsafe { sqlite3_complete(s) };
@@ -538,17 +594,31 @@ mod tests {
     #[test]
     fn test_prepare_empty() {
         let conn = Connection::open(MEMORY, OpenFlags::default()).unwrap();
-        let result = conn.prepare("").unwrap();
-        assert!(result.is_none());
+        let (result, tail) = conn.prepare("");
+        assert!(
+            result.as_ref().is_ok_and(Option::is_none),
+            "Received statement: {result:?}"
+        );
+        assert_eq!(tail, "");
+    }
+
+    #[test]
+    fn test_prepare_junk_statement() {
+        let conn = Connection::open(MEMORY, OpenFlags::default()).unwrap();
+        let (stmt_result, tail) = conn.prepare("values (; select 42;");
+        assert!(stmt_result.is_err(), "Received statement: {stmt_result:?}");
+        assert_eq!(tail, " select 42;");
     }
 
     #[test]
     fn test_read_values() {
         let conn = Connection::open(MEMORY, OpenFlags::default()).unwrap();
-        let (mut stmt, _) = conn
-            .prepare("select 123 as \"int\", 'foo' as \"text\", null as \"null\";")
-            .unwrap()
-            .expect("statement is not empty");
+        let (stmt_result, tail) = conn.prepare(
+            "select 123 as \"int\", 'foo' as \"text\", null as \"null\"; \
+            -- trailing comment",
+        );
+        assert_eq!(tail, " -- trailing comment");
+        let mut stmt = stmt_result.unwrap().expect("statement is not empty");
         assert_eq!(stmt.column_count(), 3);
         assert_eq!(stmt.column_name(0), Some(String::from("int")));
         assert_eq!(stmt.column_name(1), Some(String::from("text")));
@@ -569,8 +639,9 @@ mod tests {
     #[test]
     fn test_bind_text() {
         let conn = Connection::open(MEMORY, OpenFlags::default()).unwrap();
-        let (mut stmt, _) = conn
+        let mut stmt = conn
             .prepare("select ?1;")
+            .0
             .unwrap()
             .expect("statement is not empty");
         const WANT: &str = "Hello, World!\n";

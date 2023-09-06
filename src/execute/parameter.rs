@@ -36,12 +36,12 @@ pub(super) fn bind_prepared_stmt(
     }
     let mut param_stmt = conn
         .prepare("SELECT value FROM temp.sqlite_parameters WHERE key=?1")
+        .0
         .map_err(|mut err| {
             err.clear_error_offset();
             err
         })?
-        .unwrap()
-        .0;
+        .unwrap();
     let num_buf = &mut Vec::<u8>::with_capacity(30);
     for i in 1..=n {
         let var_name = stmt
@@ -78,9 +78,9 @@ pub(super) fn init(conn: &mut Connection) -> zombiezen_sqlite::Result<()> {
 
     conn.config(ConfigFlag::Defensive, false)?;
     conn.config(ConfigFlag::WritableSchema, true)?;
-    let mut stmt_result = conn.prepare(include_str!("parameters.sql"));
+    let mut stmt_result = conn.prepare(include_str!("parameters.sql")).0;
     match stmt_result {
-        Ok(Some((ref mut stmt, _))) => {
+        Ok(Some(ref mut stmt)) => {
             loop {
                 match stmt.step() {
                     // Shouldn't happen, but also shouldn't error.
@@ -114,20 +114,23 @@ pub(super) fn init(conn: &mut Connection) -> zombiezen_sqlite::Result<()> {
 pub(super) fn set(conn: &mut Connection, key: &str, value: &str) -> zombiezen_sqlite::Result<()> {
     init(conn)?;
     debug!(key = key, value = value, "Setting parameter...");
-    let mut stmt = match conn.prepare(&format!(
-        "REPLACE INTO temp.sqlite_parameters(key,value) \
+    let mut stmt = match conn
+        .prepare(&format!(
+            "REPLACE INTO temp.sqlite_parameters(key,value) \
          VALUES (?1, {value});"
-    )) {
-        Ok(Some((stmt, _))) => stmt,
+        ))
+        .0
+    {
+        Ok(Some(stmt)) => stmt,
         Ok(None) => unreachable!("Statement not empty"),
         Err(_) => {
             // Value might not be SQL syntax.
             // Fallback to text.
             debug!(value = value, "Falling back to text for parameter value");
             let mut stmt = conn
-                .prepare("REPLACE INTO temp.sqlite_parameters(key,value) VALUES (?1, ?2);")?
-                .unwrap()
-                .0;
+                .prepare("REPLACE INTO temp.sqlite_parameters(key,value) VALUES (?1, ?2);")
+                .0?
+                .unwrap();
             stmt.bind_text(2, value)?;
             stmt
         }
@@ -139,7 +142,7 @@ pub(super) fn set(conn: &mut Connection, key: &str, value: &str) -> zombiezen_sq
 }
 
 pub(super) fn unset(conn: &Conn, key: &str) -> zombiezen_sqlite::Result<()> {
-    let Ok(Some((mut stmt, _))) = conn.prepare("DELETE FROM temp.sqlite_parameters WHERE key = ?") else {
+    let Ok(Some(mut stmt)) = conn.prepare("DELETE FROM temp.sqlite_parameters WHERE key = ?").0 else {
         // Table may not exist. Ignore error.
         return Ok(());
     };
@@ -149,8 +152,11 @@ pub(super) fn unset(conn: &Conn, key: &str) -> zombiezen_sqlite::Result<()> {
 }
 
 pub(super) fn clear(conn: &Conn) -> zombiezen_sqlite::Result<()> {
-    let mut stmt = match conn.prepare("DROP TABLE IF EXISTS temp.sqlite_parameters;") {
-        Ok(Some((stmt, _))) => stmt,
+    let mut stmt = match conn
+        .prepare("DROP TABLE IF EXISTS temp.sqlite_parameters;")
+        .0
+    {
+        Ok(Some(stmt)) => stmt,
         Ok(None) => unreachable!("Statement not empty"),
         Err(mut err) => {
             err.clear_error_offset();
@@ -172,8 +178,11 @@ pub(super) fn clear(conn: &Conn) -> zombiezen_sqlite::Result<()> {
 }
 
 pub(super) fn list(result: &mut SQLiteOutputBuilder, conn: &Conn) -> zombiezen_sqlite::Result<()> {
-    let column_width = match conn.prepare("SELECT max(length(key)) FROM temp.sqlite_parameters;") {
-        Ok(Some((mut stmt, _))) => match stmt.step() {
+    let column_width = match conn
+        .prepare("SELECT max(length(key)) FROM temp.sqlite_parameters;")
+        .0
+    {
+        Ok(Some(mut stmt)) => match stmt.step() {
             Ok(StepResult::Row) => stmt.column_i64(0).clamp(0, 40) as usize,
             _ => 0usize,
         },
@@ -198,8 +207,11 @@ pub(super) fn list(result: &mut SQLiteOutputBuilder, conn: &Conn) -> zombiezen_s
                                 </tr></thead>\n\
                                 <tbody>\n",
     );
-    let mut stmt = match conn.prepare("SELECT key, quote(value) FROM temp.sqlite_parameters;") {
-        Ok(Some((stmt, _))) => stmt,
+    let mut stmt = match conn
+        .prepare("SELECT key, quote(value) FROM temp.sqlite_parameters;")
+        .0
+    {
+        Ok(Some(stmt)) => stmt,
         Ok(None) => unreachable!("Statement not empty"),
         Err(mut err) => {
             err.clear_error_offset();

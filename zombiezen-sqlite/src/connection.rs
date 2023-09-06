@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::{c_int, CStr};
 use std::fmt::Debug;
 use std::mem::{self, MaybeUninit};
 use std::ops::Deref;
@@ -8,8 +8,8 @@ use std::ptr::{self, NonNull};
 use bitflags::bitflags;
 use libsqlite3_sys::{
     sqlite3, sqlite3_close, sqlite3_db_config, sqlite3_db_readonly, sqlite3_open_v2,
-    sqlite3_prepare_v2, sqlite3_txn_state, SQLITE_DBCONFIG_DEFENSIVE, SQLITE_DBCONFIG_DQS_DDL,
-    SQLITE_DBCONFIG_DQS_DML, SQLITE_DBCONFIG_ENABLE_FKEY, SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER,
+    sqlite3_txn_state, SQLITE_DBCONFIG_DEFENSIVE, SQLITE_DBCONFIG_DQS_DDL, SQLITE_DBCONFIG_DQS_DML,
+    SQLITE_DBCONFIG_ENABLE_FKEY, SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER,
     SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, SQLITE_DBCONFIG_ENABLE_QPSG,
     SQLITE_DBCONFIG_ENABLE_TRIGGER, SQLITE_DBCONFIG_ENABLE_VIEW,
     SQLITE_DBCONFIG_LEGACY_ALTER_TABLE, SQLITE_DBCONFIG_LEGACY_FILE_FORMAT,
@@ -130,36 +130,6 @@ impl Conn {
     #[inline]
     pub(crate) fn as_ptr(&self) -> *mut sqlite3 {
         self.db.as_ptr()
-    }
-
-    pub fn prepare<'c, 's>(&'c self, sql: &'s str) -> Result<Option<(Statement<'c>, &'s str)>> {
-        let n_byte: c_int = sql
-            .len()
-            .try_into()
-            .map_err(|_| ResultCode::TOOBIG.to_result().unwrap_err())?;
-        let mut stmt = MaybeUninit::uninit();
-        let z_sql = sql.as_ptr() as *const c_char;
-        let mut tail = MaybeUninit::uninit();
-        let rc = ResultCode(unsafe {
-            sqlite3_prepare_v2(
-                self.as_ptr(),
-                z_sql,
-                n_byte,
-                stmt.as_mut_ptr(),
-                tail.as_mut_ptr(),
-            )
-        });
-        if rc != ResultCode::OK {
-            debug_assert!(unsafe { stmt.assume_init() }.is_null());
-            return Err(self.error().unwrap());
-        }
-
-        Ok(NonNull::new(unsafe { stmt.assume_init() }).map(|ptr| {
-            let n = unsafe { tail.assume_init().offset_from(z_sql) };
-            let stmt = Statement::new(ptr);
-            let tail = sql.split_at(n as usize).1;
-            (stmt, tail)
-        }))
     }
 
     /// Reports whether the given schema is attached as read-only.

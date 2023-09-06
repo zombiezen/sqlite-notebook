@@ -282,8 +282,9 @@ mod tests {
             },
         )
         .unwrap();
-        let (mut stmt, _) = conn
+        let mut stmt = conn
             .prepare("select noop(123);")
+            .0
             .unwrap()
             .expect("statement is not empty");
         assert_eq!(stmt.step().unwrap(), StepResult::Row);
@@ -306,8 +307,9 @@ mod tests {
             },
         )
         .unwrap();
-        let (mut stmt, _) = conn
+        let mut stmt = conn
             .prepare("select my_text(123);")
+            .0
             .unwrap()
             .expect("statement is not empty");
         assert_eq!(stmt.step().unwrap(), StepResult::Row);
