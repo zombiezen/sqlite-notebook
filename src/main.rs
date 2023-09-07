@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs;
 use std::iter;
@@ -119,54 +119,9 @@ fn run(args: Args) -> Result<()> {
     };
     debug!(session_id = session_id, "Generated session ID");
     let (_database_directory, mut conn) = {
-        let span = debug_span!("sqlite3_open", path = field::Empty);
-        let _enter = span.enter();
         let dir = TempDir::new("sqlite-notebook")?;
         let db_path = dir.path().join("database.sqlite");
-        span.record("path", db_path.to_string_lossy().as_ref());
-        let mut conn = Connection::open(cstr_from_osstr(&db_path), OpenFlags::default())?;
-        conn.create_scalar_function(
-            const_cstr!("regexp").as_cstr(),
-            Some(2),
-            FunctionFlags::DETERMINISTIC,
-            regexp_func,
-        )?;
-        conn.create_scalar_function(
-            const_cstr!("shell_add_schema").as_cstr(),
-            Some(3),
-            FunctionFlags::empty(),
-            |mut ctx, args| {
-                let mut input_value = args.next().unwrap();
-                let input = match input_value.to_text() {
-                    Ok(s) => s,
-                    Err(_) => {
-                        ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
-                        return;
-                    }
-                };
-                let mut schema_value = args.next().unwrap();
-                let schema = match schema_value.to_text() {
-                    Ok(s) => s,
-                    Err(_) => {
-                        ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
-                        return;
-                    }
-                };
-                let mut name_value = args.next().unwrap();
-                let name = match name_value.to_text() {
-                    Ok(s) => s,
-                    Err(_) => {
-                        ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
-                        return;
-                    }
-                };
-                if let Some(s) = shell_add_schema_name(input, schema, name) {
-                    ctx.result_text(s);
-                } else {
-                    ctx.result_value(&input_value);
-                }
-            },
-        )?;
+        let conn = open_conn(&cstr_from_osstr(&db_path))?;
         (dir, conn)
     };
 
@@ -261,6 +216,57 @@ fn run(args: Args) -> Result<()> {
             }
         }
     }
+}
+
+fn open_conn(db_path: &(impl AsRef<CStr> + ?Sized)) -> zombiezen_sqlite::Result<Connection> {
+    let db_path = db_path.as_ref();
+    let span = debug_span!("sqlite3_open", path = db_path.to_string_lossy().as_ref());
+    let _enter = span.enter();
+
+    let mut conn = Connection::open(db_path, OpenFlags::default())?;
+    conn.create_scalar_function(
+        const_cstr!("regexp").as_cstr(),
+        Some(2),
+        FunctionFlags::DETERMINISTIC,
+        regexp_func,
+    )?;
+    conn.create_scalar_function(
+        const_cstr!("shell_add_schema").as_cstr(),
+        Some(3),
+        FunctionFlags::empty(),
+        |mut ctx, args| {
+            let mut input_value = args.next().unwrap();
+            let input = match input_value.to_text() {
+                Ok(s) => s,
+                Err(_) => {
+                    ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
+                    return;
+                }
+            };
+            let mut schema_value = args.next().unwrap();
+            let schema = match schema_value.to_text() {
+                Ok(s) => s,
+                Err(_) => {
+                    ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
+                    return;
+                }
+            };
+            let mut name_value = args.next().unwrap();
+            let name = match name_value.to_text() {
+                Ok(s) => s,
+                Err(_) => {
+                    ctx.result_error(ResultCode::ERROR, "invalid UTF-8");
+                    return;
+                }
+            };
+            if let Some(s) = shell_add_schema_name(input, schema, name) {
+                ctx.result_text(s);
+            } else {
+                ctx.result_value(&input_value);
+            }
+        },
+    )?;
+    Ok(conn)
 }
 
 fn handle_shell<S, K>(

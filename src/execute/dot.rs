@@ -6,9 +6,9 @@ use std::{env, fs};
 use anyhow::Result;
 use tracing::debug;
 use zombiezen_const_cstr::const_cstr;
-use zombiezen_sqlite::{Connection, OpenFlags, ResultCode, ResultExt, TransactionState};
+use zombiezen_sqlite::{Connection, ResultCode, ResultExt, TransactionState};
 
-use crate::c::cstring_until_first_nul;
+use crate::{c::cstring_until_first_nul, open_conn};
 
 use super::*;
 
@@ -57,10 +57,7 @@ pub(super) fn process_dot_command<'a>(
                 cwd = cwd.display().to_string(),
                 "Opening new database"
             );
-            *conn = match Connection::open(
-                cstring_until_first_nul(line.args[0].as_bytes()),
-                OpenFlags::default(),
-            ) {
+            *conn = match open_conn(&cstring_until_first_nul(line.args[0].as_bytes())) {
                 Ok(conn) => conn,
                 Err(mut err) => {
                     err.clear_error_offset();
