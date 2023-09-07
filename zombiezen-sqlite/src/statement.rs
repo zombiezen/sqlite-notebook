@@ -656,9 +656,11 @@ mod tests {
 
     #[test]
     fn test_is_complete() {
+        assert!(!is_complete(const_cstr!("")));
+        assert!(!is_complete(const_cstr!("-- Foo")));
+        assert!(!is_complete(const_cstr!("-- Foo;")));
         assert!(!is_complete(const_cstr!("select 1")));
         assert!(is_complete(const_cstr!("select 1;")));
         assert!(!is_complete(const_cstr!("create table foo (")));
-        // TODO(soon): assert!(!is_complete(const_cstr!("create table foo (;")));
     }
 }

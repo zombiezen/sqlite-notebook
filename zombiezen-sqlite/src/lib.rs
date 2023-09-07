@@ -7,6 +7,7 @@ use std::str;
 
 use libsqlite3_sys::sqlite3_libversion;
 
+mod auth;
 mod bytearray;
 pub mod column_metadata;
 mod connection;
@@ -17,6 +18,7 @@ mod result;
 mod statement;
 mod value;
 
+pub use auth::*;
 pub use connection::*;
 pub use function::*;
 pub use glob::*;

@@ -24,10 +24,10 @@ use libsqlite3_sys::{
 use crate::*;
 
 /// An owned connection to a SQLite database.
-#[repr(transparent)]
 #[derive(Debug)]
 pub struct Connection {
     ptr: NonNull<sqlite3>,
+    pub(crate) authorizer: *mut AuthorizerFn,
 }
 
 impl Connection {
@@ -51,7 +51,10 @@ impl Connection {
             Some(db) => db,
             None => return Err(ResultCode::NOMEM.to_result().unwrap_err()),
         };
-        let mut conn = Connection { ptr: db }; // Now will drop properly.
+        let mut conn = Connection {
+            ptr: db,
+            authorizer: ptr::null_mut(),
+        }; // Now will drop properly.
         if rc != ResultCode::OK {
             return Err(conn.as_ref().error().unwrap());
         }
@@ -102,6 +105,9 @@ impl Borrow<Conn> for Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         unsafe {
+            if !self.authorizer.is_null() {
+                let _ = self.clear_authorizer();
+            }
             assert_eq!(
                 ResultCode(sqlite3_close(self.ptr.as_ptr() as *mut sqlite3)),
                 ResultCode::OK
