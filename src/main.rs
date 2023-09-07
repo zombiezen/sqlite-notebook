@@ -407,38 +407,117 @@ fn is_complete(
     let span = debug_span!("is_complete", status = field::Empty);
     let _enter = span.enter();
 
-    let code = request.code.as_bytes();
-    let mut buf = Vec::with_capacity(code.len() + 2);
-    buf.extend(code);
-    if !code.ends_with(b";") {
-        buf.push(b';');
-    }
-    buf.push(0);
-    let code = match CString::from_vec_with_nul(buf) {
-        Ok(code) => code,
-        Err(_) => {
-            span.record("status", format!("{:?}", wire::IsCompleteStatus::Invalid));
-            return Ok(wire::IsCompleteReply {
-                status: wire::IsCompleteStatus::Invalid,
-                indent: None,
-            });
+    let status = scan(request.code.as_str());
+    span.record("status", format!("{:?}", status));
+    Ok(wire::IsCompleteReply {
+        status,
+        indent: if status == wire::IsCompleteStatus::Incomplete {
+            Some(String::new())
+        } else {
+            None
+        },
+    })
+}
+
+fn scan(code: &str) -> wire::IsCompleteStatus {
+    let mut term = None::<char>;
+    let mut iter = code.chars().peekable();
+    let mut paren_level = 0usize;
+    let mut ends_in_semicolon = true;
+    let mut can_start_dot_command = true;
+    loop {
+        let Some(c) = iter.next() else {
+            break;
+        };
+        match term {
+            None => match c {
+                '-' => {
+                    if iter.next_if(|&next| next == '-').is_some() {
+                        // Consume the line here and now.
+                        // Unlike the others, having an EOF before hitting the end of line
+                        // still results in a complete statement.
+                        iter.find(|&next| next == '\n');
+                        can_start_dot_command = true;
+                    } else {
+                        can_start_dot_command = false;
+                    }
+                }
+                '.' | '#' if can_start_dot_command => {
+                    // Consume the line here and now.
+                    // Unlike the others, having an EOF before hitting the end of line
+                    // still results in a complete statement.
+                    iter.find(|&next| next == '\n');
+                }
+                '/' => {
+                    if iter.next_if(|&next| next == '*').is_some() {
+                        term = Some('*');
+                    } else {
+                        ends_in_semicolon = false;
+                    }
+                    can_start_dot_command = false;
+                }
+                '[' => {
+                    term = Some(']');
+                    ends_in_semicolon = false;
+                    can_start_dot_command = false;
+                }
+                '`' | '\'' | '"' => {
+                    term = Some(c);
+                    ends_in_semicolon = false;
+                    can_start_dot_command = false;
+                }
+                '(' => {
+                    paren_level += 1;
+                    ends_in_semicolon = false;
+                    can_start_dot_command = false;
+                }
+                ')' => {
+                    paren_level = paren_level.saturating_sub(1);
+                    ends_in_semicolon = false;
+                    can_start_dot_command = false;
+                }
+                ';' => {
+                    ends_in_semicolon = true;
+                    can_start_dot_command = false;
+                }
+                '\n' => {
+                    can_start_dot_command = true;
+                }
+                _ => {
+                    can_start_dot_command = false;
+                    if !c.is_whitespace() {
+                        ends_in_semicolon = false;
+                    }
+                }
+            },
+            Some(t) if c == t => match t {
+                '*' => {
+                    if !iter.next_if(|&next| next == '/').is_some() {
+                        continue;
+                    }
+                    term = None;
+                }
+                '`' | '\'' | '"' => {
+                    if iter.next_if(|&next| next == t).is_some() {
+                        // Swallow doubled end-delimiter.
+                        continue;
+                    }
+                    term = None;
+                }
+                ']' => {
+                    term = None;
+                }
+                _ => unreachable!(),
+            },
+            Some(_) => {
+                // Ignore non-terminating character of state.
+            }
         }
-    };
-    if zombiezen_sqlite::is_complete(&code) {
-        span.record("status", format!("{:?}", wire::IsCompleteStatus::Complete));
-        Ok(wire::IsCompleteReply {
-            status: wire::IsCompleteStatus::Complete,
-            indent: None,
-        })
+    }
+    if term.is_none() && paren_level == 0 && ends_in_semicolon {
+        wire::IsCompleteStatus::Complete
     } else {
-        span.record(
-            "status",
-            format!("{:?}", wire::IsCompleteStatus::Incomplete),
-        );
-        Ok(wire::IsCompleteReply {
-            status: wire::IsCompleteStatus::Incomplete,
-            indent: Some(String::new()),
-        })
+        wire::IsCompleteStatus::Incomplete
     }
 }
 
@@ -602,6 +681,8 @@ fn strip_iprefix<'a, 'b>(s: &'a str, prefix: &'b str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    use crate::wire::{IsCompleteRequest, IsCompleteStatus};
+
     use super::*;
 
     #[test]
@@ -617,6 +698,74 @@ mod tests {
                 .as_ref()
                 .map(String::as_str),
             Some("CREATE TABLE xyz.t1(x)"),
+        );
+    }
+
+    #[test]
+    fn test_is_complete() {
+        assert_eq!(
+            is_complete(&IsCompleteRequest {
+                code: String::from(""),
+            })
+            .unwrap()
+            .status,
+            IsCompleteStatus::Complete
+        );
+        assert_eq!(
+            is_complete(&IsCompleteRequest {
+                code: String::from("-- Foo"),
+            })
+            .unwrap()
+            .status,
+            IsCompleteStatus::Complete
+        );
+        assert_eq!(
+            is_complete(&IsCompleteRequest {
+                code: String::from("# Foo"),
+            })
+            .unwrap()
+            .status,
+            IsCompleteStatus::Complete
+        );
+        assert_eq!(
+            is_complete(&IsCompleteRequest {
+                code: String::from(".parameter set :x 123"),
+            })
+            .unwrap()
+            .status,
+            IsCompleteStatus::Complete
+        );
+        assert_eq!(
+            is_complete(&IsCompleteRequest {
+                code: String::from("CREATE TABLE foo ("),
+            })
+            .unwrap()
+            .status,
+            IsCompleteStatus::Incomplete
+        );
+        assert_eq!(
+            is_complete(&IsCompleteRequest {
+                code: String::from("SELECT 2 + 2"),
+            })
+            .unwrap()
+            .status,
+            IsCompleteStatus::Incomplete
+        );
+        assert_eq!(
+            is_complete(&IsCompleteRequest {
+                code: String::from("SELECT 2 + 2;"),
+            })
+            .unwrap()
+            .status,
+            IsCompleteStatus::Complete
+        );
+        assert_eq!(
+            is_complete(&IsCompleteRequest {
+                code: String::from("SELECT 2 FROM"),
+            })
+            .unwrap()
+            .status,
+            IsCompleteStatus::Incomplete
         );
     }
 }
