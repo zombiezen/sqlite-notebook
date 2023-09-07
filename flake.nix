@@ -31,12 +31,13 @@
             pkgs.cargo
             pkgs.rust-analyzer
             pkgs.rustfmt
-            pkgs.valgrind
 
             (pkgs.python3.withPackages (ps: [
               ps.notebook
               ps.jupyter_console
             ]))
+          ] ++ pkgs.lib.lists.optional (builtins.elem system pkgs.valgrind.meta.platforms && !pkgs.valgrind.meta.broken or false) [
+            pkgs.valgrind
           ];
         };
       }
