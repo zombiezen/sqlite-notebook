@@ -16,7 +16,7 @@ use libsqlite3_sys::{
 ///
 /// [result code]: https://www.sqlite.org/rescode.html
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResultCode(pub(crate) c_int);
 
 impl ResultCode {
@@ -164,6 +164,139 @@ impl From<ResultCode> for c_int {
 impl Default for ResultCode {
     fn default() -> Self {
         ResultCode::OK
+    }
+}
+
+impl fmt::Debug for ResultCode {
+    /// Writes the SQLite C constant name, if known,
+    /// or the default debug formatting otherwise.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        macro_rules! format_constant_names {
+            ( $x:expr, $f:expr, $($i:ident),* $(,)* ) => {
+                {
+                    let x = $x;
+                    let f = $f;
+                    match x {
+                        $(
+                            ::libsqlite3_sys::$i => f.write_str(::std::stringify!($i)),
+                        )*
+                        _ => f.debug_tuple("ResultCode").field(&x).finish()
+                    }
+                }
+            };
+        }
+
+        format_constant_names!(
+            self.0,
+            f,
+            SQLITE_OK,
+            SQLITE_ERROR,
+            SQLITE_INTERNAL,
+            SQLITE_PERM,
+            SQLITE_ABORT,
+            SQLITE_BUSY,
+            SQLITE_LOCKED,
+            SQLITE_NOMEM,
+            SQLITE_READONLY,
+            SQLITE_INTERRUPT,
+            SQLITE_IOERR,
+            SQLITE_CORRUPT,
+            SQLITE_NOTFOUND,
+            SQLITE_FULL,
+            SQLITE_CANTOPEN,
+            SQLITE_PROTOCOL,
+            SQLITE_EMPTY,
+            SQLITE_SCHEMA,
+            SQLITE_TOOBIG,
+            SQLITE_CONSTRAINT,
+            SQLITE_MISMATCH,
+            SQLITE_MISUSE,
+            SQLITE_NOLFS,
+            SQLITE_AUTH,
+            SQLITE_FORMAT,
+            SQLITE_RANGE,
+            SQLITE_NOTADB,
+            SQLITE_NOTICE,
+            SQLITE_WARNING,
+            SQLITE_ROW,
+            SQLITE_DONE,
+            SQLITE_ERROR_MISSING_COLLSEQ,
+            SQLITE_ERROR_RETRY,
+            SQLITE_ERROR_SNAPSHOT,
+            SQLITE_IOERR_READ,
+            SQLITE_IOERR_SHORT_READ,
+            SQLITE_IOERR_WRITE,
+            SQLITE_IOERR_FSYNC,
+            SQLITE_IOERR_DIR_FSYNC,
+            SQLITE_IOERR_TRUNCATE,
+            SQLITE_IOERR_FSTAT,
+            SQLITE_IOERR_UNLOCK,
+            SQLITE_IOERR_RDLOCK,
+            SQLITE_IOERR_DELETE,
+            SQLITE_IOERR_BLOCKED,
+            SQLITE_IOERR_NOMEM,
+            SQLITE_IOERR_ACCESS,
+            SQLITE_IOERR_CHECKRESERVEDLOCK,
+            SQLITE_IOERR_LOCK,
+            SQLITE_IOERR_CLOSE,
+            SQLITE_IOERR_DIR_CLOSE,
+            SQLITE_IOERR_SHMOPEN,
+            SQLITE_IOERR_SHMSIZE,
+            SQLITE_IOERR_SHMLOCK,
+            SQLITE_IOERR_SHMMAP,
+            SQLITE_IOERR_SEEK,
+            SQLITE_IOERR_DELETE_NOENT,
+            SQLITE_IOERR_MMAP,
+            SQLITE_IOERR_GETTEMPPATH,
+            SQLITE_IOERR_CONVPATH,
+            SQLITE_IOERR_VNODE,
+            SQLITE_IOERR_AUTH,
+            SQLITE_IOERR_BEGIN_ATOMIC,
+            SQLITE_IOERR_COMMIT_ATOMIC,
+            SQLITE_IOERR_ROLLBACK_ATOMIC,
+            SQLITE_IOERR_DATA,
+            SQLITE_IOERR_CORRUPTFS,
+            SQLITE_LOCKED_SHAREDCACHE,
+            SQLITE_LOCKED_VTAB,
+            SQLITE_BUSY_RECOVERY,
+            SQLITE_BUSY_SNAPSHOT,
+            SQLITE_BUSY_TIMEOUT,
+            SQLITE_CANTOPEN_NOTEMPDIR,
+            SQLITE_CANTOPEN_ISDIR,
+            SQLITE_CANTOPEN_FULLPATH,
+            SQLITE_CANTOPEN_CONVPATH,
+            SQLITE_CANTOPEN_DIRTYWAL,
+            SQLITE_CANTOPEN_SYMLINK,
+            SQLITE_CORRUPT_VTAB,
+            SQLITE_CORRUPT_SEQUENCE,
+            SQLITE_CORRUPT_INDEX,
+            SQLITE_READONLY_RECOVERY,
+            SQLITE_READONLY_CANTLOCK,
+            SQLITE_READONLY_ROLLBACK,
+            SQLITE_READONLY_DBMOVED,
+            SQLITE_READONLY_CANTINIT,
+            SQLITE_READONLY_DIRECTORY,
+            SQLITE_ABORT_ROLLBACK,
+            SQLITE_CONSTRAINT_CHECK,
+            SQLITE_CONSTRAINT_COMMITHOOK,
+            SQLITE_CONSTRAINT_FOREIGNKEY,
+            SQLITE_CONSTRAINT_FUNCTION,
+            SQLITE_CONSTRAINT_NOTNULL,
+            SQLITE_CONSTRAINT_PRIMARYKEY,
+            SQLITE_CONSTRAINT_TRIGGER,
+            SQLITE_CONSTRAINT_UNIQUE,
+            SQLITE_CONSTRAINT_VTAB,
+            SQLITE_CONSTRAINT_ROWID,
+            SQLITE_CONSTRAINT_PINNED,
+            SQLITE_CONSTRAINT_DATATYPE,
+            SQLITE_NOTICE_RECOVER_WAL,
+            SQLITE_NOTICE_RECOVER_ROLLBACK,
+            SQLITE_NOTICE_RBU,
+            SQLITE_WARNING_AUTOINDEX,
+            SQLITE_AUTH_USER,
+            SQLITE_OK_LOAD_PERMANENTLY,
+            SQLITE_OK_SYMLINK,
+        )
     }
 }
 
