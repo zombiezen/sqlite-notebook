@@ -1,5 +1,5 @@
 use std::ffi::{CStr, CString};
-use std::fmt;
+use std::fmt::{self, Write};
 use std::fs;
 use std::iter;
 use std::path::PathBuf;
@@ -19,7 +19,8 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Builder as UuidBuilder;
 use zombiezen_const_cstr::const_cstr;
 use zombiezen_sqlite::{
-    stricmp, Connection, Context, FunctionFlags, OpenFlags, ProtectedValue, ResultCode, ResultExt,
+    stricmp, Connection, Context, FunctionFlags, OpenFlags, ProtectedValue, Quote, ResultCode,
+    ResultExt,
 };
 use zombiezen_zmq::{
     Context as ZeroMQContext, Errno, Events, PollItem, RecvFlags, SendFlags, Socket,
@@ -615,13 +616,9 @@ fn shell_add_schema_name(input: &str, schema: &str, _name: &str) -> Option<Strin
                 continue;
             };
             let mut buf = String::new();
-            buf.push_str(START);
-            buf.push_str(prefix);
-            buf.push_str(" ");
+            write!(&mut buf, "{START}{prefix} ").unwrap();
             if !schema.is_empty() {
-                // TODO(someday): Quote.
-                buf.push_str(schema);
-                buf.push_str(".");
+                write!(&mut buf, "{schema}.", schema = Quote::as_id(schema)).unwrap();
             }
             // TODO(someday): Rename if needed.
             buf.push_str(tail);
