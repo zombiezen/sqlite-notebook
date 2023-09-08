@@ -335,10 +335,10 @@ fn import(
     args: &[impl AsRef<str>],
     stderr: &mut String,
 ) -> zombiezen_sqlite::Result<()> {
-    // Initial lines to skip.
     let mut filename = None::<&str>;
     let mut table = None::<&str>;
     let mut schema = None::<&str>;
+    let mut ascii = false;
     let mut skip = 0usize;
     {
         let mut arg_iter = args.iter().map(AsRef::as_ref);
@@ -347,14 +347,11 @@ fn import(
                 arg = &arg[1..];
             }
             match arg {
-                "-skip" => {
-                    let Some(value) = arg_iter.next().and_then(|v| v.parse().ok()) else {
-                        let mut msg = String::new();
-                        msg.push_str("Missing or invalid argument for -skip.\n");
-                        display_help(&mut msg, Some("import"));
-                        return Err(zombiezen_sqlite::Error::new(ResultCode::MISUSE, msg));
-                    };
-                    skip = value;
+                "-ascii" => {
+                    ascii = true;
+                }
+                "-csv" => {
+                    ascii = false;
                 }
                 "-schema" => {
                     let Some(value) = arg_iter.next() else {
@@ -365,8 +362,14 @@ fn import(
                     };
                     schema = Some(value);
                 }
-                "-csv" => {
-                    // No-op. Compatibility with SQLite shell.
+                "-skip" => {
+                    let Some(value) = arg_iter.next().and_then(|v| v.parse().ok()) else {
+                        let mut msg = String::new();
+                        msg.push_str("Missing or invalid argument for -skip.\n");
+                        display_help(&mut msg, Some("import"));
+                        return Err(zombiezen_sqlite::Error::new(ResultCode::MISUSE, msg));
+                    };
+                    skip = value;
                 }
                 _ if arg.starts_with("-") => {
                     let mut msg = String::new();
@@ -402,8 +405,12 @@ fn import(
         return Err(zombiezen_sqlite::Error::new(ResultCode::MISUSE, msg));
     };
 
-    let mut file = CsvReaderBuilder::new()
-        .has_headers(false)
+    let mut csv_builder = CsvReaderBuilder::new();
+    csv_builder.has_headers(false).flexible(true);
+    if ascii {
+        csv_builder.ascii();
+    }
+    let mut file = csv_builder
         .from_path(filename)
         .map_err(|err| zombiezen_sqlite::Error::new(ResultCode::IOERR, err.to_string()))?;
     let mut row = StringRecord::new();
@@ -492,9 +499,29 @@ fn import(
         if !has_row {
             break;
         }
-        // TODO(soon): Permit more or less columns.
-        for (i, val) in row.iter().enumerate() {
+        for (i, val) in row.iter().take(column_count).enumerate() {
             insert_stmt.bind_text(1 + i, val)?;
+        }
+        let row_column_count = row.len();
+        if row_column_count > column_count {
+            writeln!(
+                stderr,
+                "{filename}:{lineno}: expected {column_count} columns \
+                but found {row_column_count} - extras ignored",
+                lineno = file.position().line()
+            )
+            .unwrap();
+        } else if row_column_count < column_count {
+            writeln!(
+                stderr,
+                "{filename}:{lineno}: expected {column_count} columns \
+                but found {row_column_count} - filling the rest with NULL",
+                lineno = file.position().line()
+            )
+            .unwrap();
+            for i in row_column_count..column_count {
+                insert_stmt.bind_null(1 + i)?;
+            }
         }
         let _ = insert_stmt.step(); // Captured by reset below:
         if let Err(err) = insert_stmt.reset() {
@@ -821,6 +848,7 @@ mod tests {
                 (String::from("Ringo"), String::from("Starr"), 1940),
             ],
         );
+        assert!(stderr.is_empty());
     }
 
     #[test]
@@ -864,6 +892,45 @@ mod tests {
                 (String::from("Ringo"), String::from("Starr"), 1940),
             ],
         );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_import_flexible() {
+        let db =
+            Connection::open(<&CStr>::default(), OpenFlags::default() | OpenFlags::MEMORY).unwrap();
+        let mut csv_file = NamedTempFile::new().unwrap();
+        csv_file
+            .write(include_bytes!("flexible_import_test.csv"))
+            .unwrap();
+
+        let mut stderr = String::new();
+        import(&db, &[csv_file.path().to_str().unwrap(), "kv"], &mut stderr).unwrap();
+
+        let mut stmt = db
+            .prepare("SELECT key, value FROM kv ORDER BY cast(n as integer)")
+            .0
+            .unwrap()
+            .unwrap();
+        let mut results = Vec::<(String, Option<String>)>::new();
+        while stmt.step().unwrap().has_row() {
+            let key = stmt.column_text(0).unwrap().to_string();
+            let value = if stmt.column_type(1).is_null() {
+                None
+            } else {
+                Some(stmt.column_text(1).unwrap().to_string())
+            };
+            results.push((key, value));
+        }
+        assert_eq!(
+            results,
+            vec![
+                (String::from("foo"), Some(String::from("bar"))),
+                (String::from("spam"), None),
+            ],
+        );
+        assert!(stderr.contains("extras ignored"));
+        assert!(stderr.contains("filling the rest with NULL"));
     }
 
     #[test]

@@ -2,12 +2,14 @@
 .help ?-all? ?PATTERN?   Show help text for PATTERN
 .import FILE TABLE       Import data from FILE into TABLE
    Options:
+     --ascii               Use \037 and \036 as column and row separators
      --csv                 Use , and \n as column and row separators
      --skip N              Skip the first N rows of input
      --schema S            Target table to be S.TABLE
    Notes:
-     If TABLE does not exist, it is created.  The first row of input
-     determines the column names.
+     *  If TABLE does not exist, it is created.  The first row of input
+        determines the column names.
+     *  If neither --csv or --ascii are used, the input mode is CSV.
 .open FILE               Close existing database and reopen FILE
 .parameter CMD ...       Manage SQL parameter bindings
    clear                   Erase all bindings
