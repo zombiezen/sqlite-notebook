@@ -7,9 +7,9 @@ use std::ptr::{self, NonNull};
 
 use bitflags::bitflags;
 use libsqlite3_sys::{
-    sqlite3, sqlite3_close, sqlite3_db_config, sqlite3_db_readonly, sqlite3_open_v2,
-    sqlite3_txn_state, SQLITE_DBCONFIG_DEFENSIVE, SQLITE_DBCONFIG_DQS_DDL, SQLITE_DBCONFIG_DQS_DML,
-    SQLITE_DBCONFIG_ENABLE_FKEY, SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER,
+    sqlite3, sqlite3_close, sqlite3_db_config, sqlite3_db_readonly, sqlite3_get_autocommit,
+    sqlite3_open_v2, sqlite3_txn_state, SQLITE_DBCONFIG_DEFENSIVE, SQLITE_DBCONFIG_DQS_DDL,
+    SQLITE_DBCONFIG_DQS_DML, SQLITE_DBCONFIG_ENABLE_FKEY, SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER,
     SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, SQLITE_DBCONFIG_ENABLE_QPSG,
     SQLITE_DBCONFIG_ENABLE_TRIGGER, SQLITE_DBCONFIG_ENABLE_VIEW,
     SQLITE_DBCONFIG_LEGACY_ALTER_TABLE, SQLITE_DBCONFIG_LEGACY_FILE_FORMAT,
@@ -181,6 +181,16 @@ impl Conn {
             ));
             rc.to_result().map(|_| val.assume_init() != 0)
         }
+    }
+
+    /// Reports whether the connection is in autocommit mode.
+    ///
+    /// Autocommit mode is on by default.
+    /// Autocommit mode is disabled by a `BEGIN` statement.
+    /// Autocommit mode is re-enabled by a `COMMIT` or `ROLLBACK`.
+    #[doc(alias = "sqlite3_get_autocommit")]
+    pub fn get_autocommit(&self) -> bool {
+        unsafe { sqlite3_get_autocommit(self.as_ptr()) != 0 }
     }
 }
 

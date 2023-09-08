@@ -4,9 +4,10 @@ use std::str;
 use std::{env, fs};
 
 use anyhow::Result;
+use csv::{ReaderBuilder as CsvReaderBuilder, StringRecord};
 use tracing::debug;
 use zombiezen_const_cstr::const_cstr;
-use zombiezen_sqlite::{Connection, ResultCode, ResultExt, TransactionState};
+use zombiezen_sqlite::{Conn, Connection, Quote, ResultCode, ResultExt, TransactionState};
 
 use crate::{c::cstring_until_first_nul, open_conn};
 
@@ -39,6 +40,12 @@ pub(super) fn process_dot_command<'a>(
                 ));
             }
             display_help(&mut result.stdout, line.args.get(0).map(AsRef::as_ref));
+        }
+        "import" => {
+            if let Err(mut err) = import(conn, &line.args, &mut result.stderr) {
+                err.clear_error_offset();
+                return Err((position, err));
+            }
         }
         "open" => {
             // TODO(someday): Other flags.
@@ -239,17 +246,26 @@ pub(super) fn process_dot_command<'a>(
                             schema_query.push_str(div);
                             div = " UNION ALL ";
                             schema_query.push_str("SELECT shell_add_schema(sql,");
-                            // TODO(soon): Really need to quote/escape this all better.
                             if db != "main" {
-                                write!(&mut schema_query, "'{}'", db).unwrap();
+                                write!(&mut schema_query, "{}", Quote::as_text(&db)).unwrap();
                             } else {
                                 schema_query.push_str("NULL");
                             }
                             schema_query.push_str(",name) AS sql, type, tbl_name, name, rowid,");
                             write!(&mut schema_query, "{schema_num} AS snum, ").unwrap();
                             schema_num += 1;
-                            write!(&mut schema_query, "'{db}' AS sname ").unwrap();
-                            write!(&mut schema_query, "FROM {db}.sqlite_schema").unwrap();
+                            write!(
+                                &mut schema_query,
+                                "{db} AS sname ",
+                                db = Quote::as_text(&db)
+                            )
+                            .unwrap();
+                            write!(
+                                &mut schema_query,
+                                "FROM {db}.sqlite_schema",
+                                db = Quote::as_id(&db)
+                            )
+                            .unwrap();
                         }
                         Err(mut err) => {
                             err.clear_error_offset();
@@ -265,10 +281,14 @@ pub(super) fn process_dot_command<'a>(
                     } else {
                         schema_query.push_str("lower(tbl_name)")
                     }
-                    // TODO(someday): Better quoting.
                     let is_glob = pattern.contains(&['*', '?', '[']);
-                    schema_query.push_str(if is_glob { " GLOB " } else { " LIKE " });
-                    write!(&mut schema_query, "'{pattern}' AND ").unwrap();
+                    write!(
+                        &mut schema_query,
+                        " {operator} {pattern} AND ",
+                        operator = if is_glob { "GLOB" } else { "LIKE" },
+                        pattern = Quote::as_text(pattern)
+                    )
+                    .unwrap();
                 }
                 schema_query.push_str("sql IS NOT NULL ORDER BY snum, rowid");
                 schema_query
@@ -306,6 +326,189 @@ pub(super) fn process_dot_command<'a>(
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+fn import(
+    conn: &Conn,
+    args: &[impl AsRef<str>],
+    stderr: &mut String,
+) -> zombiezen_sqlite::Result<()> {
+    // Initial lines to skip.
+    let mut filename = None::<&str>;
+    let mut table = None::<&str>;
+    let mut schema = None::<&str>;
+    let mut skip = 0usize;
+    {
+        let mut arg_iter = args.iter().map(AsRef::as_ref);
+        while let Some(mut arg) = arg_iter.next() {
+            if arg.starts_with("--") {
+                arg = &arg[1..];
+            }
+            match arg {
+                "-skip" => {
+                    let Some(value) = arg_iter.next().and_then(|v| v.parse().ok()) else {
+                        let mut msg = String::new();
+                        msg.push_str("Missing or invalid argument for -skip.\n");
+                        display_help(&mut msg, Some("import"));
+                        return Err(zombiezen_sqlite::Error::new(ResultCode::MISUSE, msg));
+                    };
+                    skip = value;
+                }
+                "-schema" => {
+                    let Some(value) = arg_iter.next() else {
+                        let mut msg = String::new();
+                        msg.push_str("Missing argument for -schema.\n");
+                        display_help(&mut msg, Some("import"));
+                        return Err(zombiezen_sqlite::Error::new(ResultCode::MISUSE, msg));
+                    };
+                    schema = Some(value);
+                }
+                "-csv" => {
+                    // No-op. Compatibility with SQLite shell.
+                }
+                _ if arg.starts_with("-") => {
+                    let mut msg = String::new();
+                    writeln!(&mut msg, "Unknown option \"{arg}\". Usage:").unwrap();
+                    display_help(&mut msg, Some("import"));
+                    return Err(zombiezen_sqlite::Error::new(ResultCode::MISUSE, msg));
+                }
+                _ => {
+                    if filename.is_none() {
+                        filename = Some(arg);
+                    } else if table.is_none() {
+                        table = Some(arg);
+                    } else {
+                        let mut msg = String::new();
+                        writeln!(&mut msg, "Extra argument: \"{arg}\". Usage:").unwrap();
+                        display_help(&mut msg, Some("import"));
+                        return Err(zombiezen_sqlite::Error::new(ResultCode::MISUSE, msg));
+                    }
+                }
+            }
+        }
+    }
+    let Some(filename) = filename else {
+        let mut msg = String::new();
+        msg.push_str("Missing FILE argument. Usage:\n");
+        display_help(&mut msg, Some("import"));
+        return Err(zombiezen_sqlite::Error::new(ResultCode::MISUSE, msg));
+    };
+    let Some(table) = table else {
+        let mut msg = String::new();
+        msg.push_str("Missing TABLE argument. Usage:\n");
+        display_help(&mut msg, Some("import"));
+        return Err(zombiezen_sqlite::Error::new(ResultCode::MISUSE, msg));
+    };
+
+    let mut file = CsvReaderBuilder::new()
+        .has_headers(false)
+        .from_path(filename)
+        .map_err(|err| zombiezen_sqlite::Error::new(ResultCode::IOERR, err.to_string()))?;
+    let mut row = StringRecord::new();
+    for _ in 0..skip {
+        file.read_record(&mut row)
+            .map_err(|err| zombiezen_sqlite::Error::new(ResultCode::IOERR, err.to_string()))?;
+    }
+
+    let full_table_name = match schema {
+        Some(schema) => format!(
+            "{schema}.{table}",
+            schema = Quote::as_id(&schema),
+            table = Quote::as_id(&table)
+        ),
+        None => Quote::as_id(&table).to_string(),
+    };
+    let column_count = {
+        match conn.prepare(&format!("SELECT * FROM {full_table_name}")).0 {
+            Ok(Some(stmt)) => stmt.column_count(),
+            Ok(_) => unreachable!(),
+            Err(err) if err.message().starts_with("no such table: ") => {
+                let has_row = file.read_record(&mut row).map_err(|err| {
+                    zombiezen_sqlite::Error::new(ResultCode::IOERR, err.to_string())
+                })?;
+                if !has_row {
+                    return Err(zombiezen_sqlite::Error::new(
+                        ResultCode::ERROR,
+                        format!("{filename}: empty file"),
+                    ));
+                }
+                // TODO(someday): Rename columns as appropriate.
+                let mut definition = String::new();
+                writeln!(&mut definition, "CREATE TABLE {full_table_name} (").unwrap();
+                for (i, header) in row.iter().enumerate() {
+                    writeln!(
+                        &mut definition,
+                        "{header} TEXT{comma}",
+                        header = Quote::as_id(header),
+                        comma = if i < row.len() - 1 { "," } else { "" }
+                    )
+                    .unwrap();
+                }
+                definition.push_str(")");
+                conn.prepare(&definition)
+                    .0
+                    .map_err(|mut err| {
+                        err.clear_error_offset();
+                        err
+                    })?
+                    .unwrap()
+                    .step()
+                    .map_err(|mut err| {
+                        err.clear_error_offset();
+                        err
+                    })?;
+                row.len()
+            }
+            Err(mut err) => {
+                err.clear_error_offset();
+                return Err(err);
+            }
+        }
+    };
+    let mut insert_stmt = {
+        let mut sql = format!("INSERT INTO {full_table_name} VALUES(?");
+        for _ in 1..column_count {
+            sql.push_str(",?");
+        }
+        sql.push_str(")");
+        conn.prepare(&sql)
+            .0
+            .map_err(|mut err| {
+                err.clear_error_offset();
+                err
+            })?
+            .unwrap()
+    };
+    let need_commit = conn.get_autocommit();
+    if need_commit {
+        exec(conn, "BEGIN")?;
+    }
+    loop {
+        let has_row = file
+            .read_record(&mut row)
+            .map_err(|err| zombiezen_sqlite::Error::new(ResultCode::IOERR, err.to_string()))?;
+        if !has_row {
+            break;
+        }
+        // TODO(soon): Permit more or less columns.
+        for (i, val) in row.iter().enumerate() {
+            insert_stmt.bind_text(1 + i, val)?;
+        }
+        let _ = insert_stmt.step(); // Captured by reset below:
+        if let Err(err) = insert_stmt.reset() {
+            writeln!(
+                stderr,
+                "{filename}:{lineno}: INSERT failed: {err}",
+                lineno = file.position().line()
+            )
+            .unwrap();
+        }
+    }
+    drop(insert_stmt);
+    if need_commit {
+        exec(conn, "COMMIT")?;
     }
     Ok(())
 }
@@ -574,7 +777,94 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CStr;
+    use std::io::Write;
+
+    use tempfile::NamedTempFile;
+    use zombiezen_sqlite::OpenFlags;
+
     use super::*;
+
+    #[test]
+    fn test_import() {
+        let db =
+            Connection::open(<&CStr>::default(), OpenFlags::default() | OpenFlags::MEMORY).unwrap();
+        let mut csv_file = NamedTempFile::new().unwrap();
+        csv_file.write(include_bytes!("import_test.csv")).unwrap();
+
+        let mut stderr = String::new();
+        import(
+            &db,
+            &[csv_file.path().to_str().unwrap(), "beatles"],
+            &mut stderr,
+        )
+        .unwrap();
+
+        let mut stmt = db
+            .prepare("SELECT first_name, last_name, birth_year FROM beatles ORDER BY last_name")
+            .0
+            .unwrap()
+            .unwrap();
+        let mut results = Vec::<(String, String, i64)>::new();
+        while stmt.step().unwrap().has_row() {
+            let first_name = stmt.column_text(0).unwrap().to_string();
+            let last_name = stmt.column_text(1).unwrap().to_string();
+            let birth_year = stmt.column_i64(2);
+            results.push((first_name, last_name, birth_year));
+        }
+        assert_eq!(
+            results,
+            vec![
+                (String::from("George"), String::from("Harrison"), 1943),
+                (String::from("John"), String::from("Lennon"), 1940),
+                (String::from("Paul"), String::from("McCartney"), 1942),
+                (String::from("Ringo"), String::from("Starr"), 1940),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_import_existing() {
+        let db =
+            Connection::open(<&CStr>::default(), OpenFlags::default() | OpenFlags::MEMORY).unwrap();
+        let mut csv_file = NamedTempFile::new().unwrap();
+        csv_file.write(include_bytes!("import_test.csv")).unwrap();
+        exec(
+            &db,
+            "CREATE TABLE beatles (first_name, last_name, birth_year INTEGER)",
+        )
+        .unwrap();
+
+        let mut stderr = String::new();
+        import(
+            &db,
+            &["-skip", "1", csv_file.path().to_str().unwrap(), "beatles"],
+            &mut stderr,
+        )
+        .unwrap();
+
+        let mut stmt = db
+            .prepare("SELECT first_name, last_name, birth_year FROM beatles ORDER BY last_name")
+            .0
+            .unwrap()
+            .unwrap();
+        let mut results = Vec::<(String, String, i64)>::new();
+        while stmt.step().unwrap().has_row() {
+            let first_name = stmt.column_text(0).unwrap().to_string();
+            let last_name = stmt.column_text(1).unwrap().to_string();
+            let birth_year = stmt.column_i64(2);
+            results.push((first_name, last_name, birth_year));
+        }
+        assert_eq!(
+            results,
+            vec![
+                (String::from("George"), String::from("Harrison"), 1943),
+                (String::from("John"), String::from("Lennon"), 1940),
+                (String::from("Paul"), String::from("McCartney"), 1942),
+                (String::from("Ringo"), String::from("Starr"), 1940),
+            ],
+        );
+    }
 
     #[test]
     fn test_display_help_prefix() {

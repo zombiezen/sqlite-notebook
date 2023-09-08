@@ -10,7 +10,7 @@ use csv::{Writer as CsvWriter, WriterBuilder as CsvWriterBuilder};
 use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::json;
 use tracing::{debug_span, field};
-use zombiezen_sqlite::{Connection, DataType, ResultExt, Statement, StepResult};
+use zombiezen_sqlite::{Conn, Connection, DataType, ResultCode, ResultExt, Statement, StepResult};
 use zombiezen_zmq::Socket;
 
 use crate::{reply, wire};
@@ -414,6 +414,25 @@ impl Default for SQLiteOutputBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Execute a single non-data-returning statement.
+fn exec(conn: &Conn, sql: &str) -> zombiezen_sqlite::Result<()> {
+    let mut stmt = conn
+        .prepare(sql)
+        .0
+        .map_err(|mut err| {
+            err.clear_error_offset();
+            err
+        })?
+        .ok_or_else(|| zombiezen_sqlite::Error::new(ResultCode::MISUSE, "Empty statement"))?;
+    assert_eq!(stmt.column_count(), 0, "Statement {:?} returns data", sql);
+    stmt.step()
+        .map_err(|mut err| {
+            err.clear_error_offset();
+            err
+        })
+        .map(|_| ())
 }
 
 fn cut<'a, 'b>(s: &'a str, sep: &'b str) -> (&'a str, Option<&'a str>) {

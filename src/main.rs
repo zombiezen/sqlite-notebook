@@ -12,7 +12,7 @@ use rand::{thread_rng, RngCore};
 use re2::RE2;
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize};
 use serde_json::json;
-use tempdir::TempDir;
+use tempfile::TempDir;
 use tracing::warn;
 use tracing::{debug, debug_span, error, field, info, trace_span, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -119,7 +119,7 @@ fn run(args: Args) -> Result<()> {
     };
     debug!(session_id = session_id, "Generated session ID");
     let (_database_directory, mut conn) = {
-        let dir = TempDir::new("sqlite-notebook")?;
+        let dir = TempDir::with_prefix("sqlite-notebook")?;
         let db_path = dir.path().join("database.sqlite");
         let conn = open_conn(&cstr_from_osstr(&db_path))?;
         (dir, conn)

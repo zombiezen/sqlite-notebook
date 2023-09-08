@@ -7,7 +7,7 @@ use zombiezen_const_cstr::const_cstr;
 use zombiezen_sqlite::column_metadata::TableColumnMetadataFlags;
 use zombiezen_sqlite::{ConfigFlag, Conn, Connection, ResultExt, Statement, StepResult};
 
-use super::{EscapeHtml, SQLiteOutputBuilder};
+use super::{exec, EscapeHtml, SQLiteOutputBuilder};
 
 /// Bind parameters from values in the `temp.sqlite_parameters` table.
 pub(super) fn bind_prepared_stmt(
@@ -78,37 +78,10 @@ pub(super) fn init(conn: &mut Connection) -> zombiezen_sqlite::Result<()> {
 
     conn.config(ConfigFlag::Defensive, false)?;
     conn.config(ConfigFlag::WritableSchema, true)?;
-    let mut stmt_result = conn.prepare(include_str!("parameters.sql")).0;
-    match stmt_result {
-        Ok(Some(ref mut stmt)) => {
-            loop {
-                match stmt.step() {
-                    // Shouldn't happen, but also shouldn't error.
-                    Ok(StepResult::Row) => {}
-                    Ok(StepResult::Done) => break,
-                    Err(mut err) => {
-                        drop(stmt_result);
-                        let _ = conn.config(ConfigFlag::Defensive, defensive_mode);
-                        let _ = conn.config(ConfigFlag::WritableSchema, writable_schema);
-                        err.clear_error_offset();
-                        return Err(err);
-                    }
-                }
-            }
-            drop(stmt_result);
-            let _ = conn.config(ConfigFlag::Defensive, defensive_mode);
-            let _ = conn.config(ConfigFlag::WritableSchema, writable_schema);
-            Ok(())
-        }
-        Ok(None) => unreachable!("Statement not empty"),
-        Err(_) => {
-            let mut err = stmt_result.unwrap_err();
-            let _ = conn.config(ConfigFlag::Defensive, defensive_mode);
-            let _ = conn.config(ConfigFlag::WritableSchema, writable_schema);
-            err.clear_error_offset();
-            Err(err)
-        }
-    }
+    let stmt_result = exec(conn, include_str!("parameters.sql"));
+    let _ = conn.config(ConfigFlag::Defensive, defensive_mode);
+    let _ = conn.config(ConfigFlag::WritableSchema, writable_schema);
+    stmt_result
 }
 
 pub(super) fn set(conn: &mut Connection, key: &str, value: &str) -> zombiezen_sqlite::Result<()> {
@@ -152,29 +125,7 @@ pub(super) fn unset(conn: &Conn, key: &str) -> zombiezen_sqlite::Result<()> {
 }
 
 pub(super) fn clear(conn: &Conn) -> zombiezen_sqlite::Result<()> {
-    let mut stmt = match conn
-        .prepare("DROP TABLE IF EXISTS temp.sqlite_parameters;")
-        .0
-    {
-        Ok(Some(stmt)) => stmt,
-        Ok(None) => unreachable!("Statement not empty"),
-        Err(mut err) => {
-            err.clear_error_offset();
-            return Err(err);
-        }
-    };
-    loop {
-        match stmt.step() {
-            // Shouldn't happen, but also shouldn't error.
-            Ok(StepResult::Row) => {}
-            Ok(StepResult::Done) => break,
-            Err(mut err) => {
-                err.clear_error_offset();
-                return Err(err);
-            }
-        }
-    }
-    Ok(())
+    exec(conn, "DROP TABLE IF EXISTS temp.sqlite_parameters;")
 }
 
 pub(super) fn list(result: &mut SQLiteOutputBuilder, conn: &Conn) -> zombiezen_sqlite::Result<()> {
