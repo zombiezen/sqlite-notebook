@@ -29,77 +29,6 @@ pub(super) fn process_dot_command<'a>(
         }
     };
     match line.name {
-        "help" => {
-            if line.args.len() > 1 {
-                return Err((
-                    position,
-                    zombiezen_sqlite::Error::new(
-                        ResultCode::MISUSE,
-                        "usage: .help ?-all? ?PATTERN?".to_string(),
-                    ),
-                ));
-            }
-            display_help(&mut result.stdout, line.args.get(0).map(AsRef::as_ref));
-        }
-        "import" => {
-            if let Err(mut err) = import(conn, &line.args, &mut result.stderr) {
-                err.clear_error_offset();
-                return Err((position, err));
-            }
-        }
-        "open" => {
-            // TODO(someday): Other flags.
-            if line.args.len() != 1 {
-                return Err((
-                    position,
-                    zombiezen_sqlite::Error::new(
-                        ResultCode::MISUSE,
-                        "usage: .open FILE".to_string(),
-                    ),
-                ));
-            }
-            let cwd = env::current_dir().unwrap_or_else(|_| "<error>".into());
-            debug!(
-                path = line.args[0].as_ref(),
-                cwd = cwd.display().to_string(),
-                "Opening new database"
-            );
-            *conn = match open_conn(&cstring_until_first_nul(line.args[0].as_bytes())) {
-                Ok(conn) => conn,
-                Err(mut err) => {
-                    err.clear_error_offset();
-                    return Err((position, err));
-                }
-            };
-        }
-        "read" => {
-            if line.args.len() != 1 {
-                return Err((
-                    position,
-                    zombiezen_sqlite::Error::new(
-                        ResultCode::MISUSE,
-                        "usage: .read FILE".to_string(),
-                    ),
-                ));
-            }
-            let cwd = env::current_dir().unwrap_or_else(|_| "<error>".into());
-            debug!(
-                path = line.args[0].as_ref(),
-                cwd = cwd.display().to_string(),
-                "Reading SQL file"
-            );
-            let path: &Path = line.args[0].as_ref().as_ref();
-            let contents = fs::read(path).map_err(|err| {
-                (
-                    position,
-                    zombiezen_sqlite::Error::new(ResultCode::IOERR, err.to_string()),
-                )
-            })?;
-            let contents = String::from_utf8_lossy(&contents);
-            run_code(conn, Some(path), &contents, result).map_err(|(position, err)| {
-                (position.map_file_name(|f| Cow::Owned(f.into_owned())), err)
-            })?;
-        }
         "databases" => {
             let databases = {
                 let mut stmt = match conn.prepare("PRAGMA database_list").0 {
@@ -152,6 +81,49 @@ pub(super) fn process_dot_command<'a>(
                 );
             }
         }
+        "help" => {
+            if line.args.len() > 1 {
+                return Err((
+                    position,
+                    zombiezen_sqlite::Error::new(
+                        ResultCode::MISUSE,
+                        "usage: .help ?-all? ?PATTERN?".to_string(),
+                    ),
+                ));
+            }
+            display_help(&mut result.stdout, line.args.get(0).map(AsRef::as_ref));
+        }
+        "import" => {
+            if let Err(mut err) = import(conn, &line.args, &mut result.stderr) {
+                err.clear_error_offset();
+                return Err((position, err));
+            }
+        }
+        "open" => {
+            // TODO(someday): Other flags.
+            if line.args.len() != 1 {
+                return Err((
+                    position,
+                    zombiezen_sqlite::Error::new(
+                        ResultCode::MISUSE,
+                        "usage: .open FILE".to_string(),
+                    ),
+                ));
+            }
+            let cwd = env::current_dir().unwrap_or_else(|_| "<error>".into());
+            debug!(
+                path = line.args[0].as_ref(),
+                cwd = cwd.display().to_string(),
+                "Opening new database"
+            );
+            *conn = match open_conn(&cstring_until_first_nul(line.args[0].as_bytes())) {
+                Ok(conn) => conn,
+                Err(mut err) => {
+                    err.clear_error_offset();
+                    return Err((position, err));
+                }
+            };
+        }
         "parameter" => match line.args.get(0).map(AsRef::as_ref) {
             Some("clear") if line.args.len() == 1 => {
                 if let Err(mut err) = parameter::clear(conn) {
@@ -159,14 +131,14 @@ pub(super) fn process_dot_command<'a>(
                     return Err((position, err));
                 }
             }
-            Some("list") if line.args.len() == 1 => {
-                if let Err(mut err) = parameter::list(result, conn) {
+            Some("init") if line.args.len() == 1 => {
+                if let Err(mut err) = parameter::init(conn) {
                     err.clear_error_offset();
                     return Err((position, err));
                 }
             }
-            Some("init") if line.args.len() == 1 => {
-                if let Err(mut err) = parameter::init(conn) {
+            Some("list") if line.args.len() == 1 => {
+                if let Err(mut err) = parameter::list(result, conn) {
                     err.clear_error_offset();
                     return Err((position, err));
                 }
@@ -192,6 +164,34 @@ pub(super) fn process_dot_command<'a>(
                 ));
             }
         },
+        "read" => {
+            if line.args.len() != 1 {
+                return Err((
+                    position,
+                    zombiezen_sqlite::Error::new(
+                        ResultCode::MISUSE,
+                        "usage: .read FILE".to_string(),
+                    ),
+                ));
+            }
+            let cwd = env::current_dir().unwrap_or_else(|_| "<error>".into());
+            debug!(
+                path = line.args[0].as_ref(),
+                cwd = cwd.display().to_string(),
+                "Reading SQL file"
+            );
+            let path: &Path = line.args[0].as_ref().as_ref();
+            let contents = fs::read(path).map_err(|err| {
+                (
+                    position,
+                    zombiezen_sqlite::Error::new(ResultCode::IOERR, err.to_string()),
+                )
+            })?;
+            let contents = String::from_utf8_lossy(&contents);
+            run_code(conn, Some(path), &contents, result).map_err(|(position, err)| {
+                (position.map_file_name(|f| Cow::Owned(f.into_owned())), err)
+            })?;
+        }
         "schema" => {
             if line.args.len() >= 2 {
                 return Err((
