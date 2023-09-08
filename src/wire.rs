@@ -273,6 +273,7 @@ pub(crate) struct IsCompleteReply {
 
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[allow(unused)]
 pub(crate) enum IsCompleteStatus {
     Complete,
     Incomplete,
