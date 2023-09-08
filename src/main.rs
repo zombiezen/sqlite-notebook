@@ -694,13 +694,13 @@ mod tests {
             shell_add_schema_name("CREATE TABLE t1(x)", "xyz", "t1")
                 .as_ref()
                 .map(String::as_str),
-            Some("CREATE TABLE xyz.t1(x)"),
+            Some("CREATE TABLE \"xyz\".t1(x)"),
         );
         assert_eq!(
             shell_add_schema_name("create table t1(x)", "xyz", "t1")
                 .as_ref()
                 .map(String::as_str),
-            Some("CREATE TABLE xyz.t1(x)"),
+            Some("CREATE TABLE \"xyz\".t1(x)"),
         );
     }
 
