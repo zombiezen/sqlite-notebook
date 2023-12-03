@@ -14,7 +14,7 @@ let pname = "sqlite-notebook"; in rustPlatform.buildRustPackage {
   src = let
     root = ./.;
     patterns = nix-gitignore.withGitignoreFile extraIgnores root;
-    extraIgnores = [ ".github" ".vscode" "*.nix" "flake.lock" ];
+    extraIgnores = [ ".github" ".vscode" "*.nix" "flake.lock" "/demo/" "/*.md" ];
   in builtins.path {
     name = "${pname}-source";
     path = root;
